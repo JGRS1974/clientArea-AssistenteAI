@@ -60,7 +60,7 @@ class AIAssistantController extends Controller
 
         try{
             $response = Prism::text()
-                ->using(Provider::OpenAI, 'gpt-4o-mini')
+                ->using(Provider::OpenAI, 'gpt-5-mini')
                 ->withMessages($messages)
                 ->withMaxSteps(3)
                 ->withTools([
@@ -70,7 +70,7 @@ class AIAssistantController extends Controller
                 ->asText();
 
             $addMessage = $this->redisConversationService->addMessage($conversationId,'assistant', $response->text);
-            ds($response->text);
+            //ds('Response AI', $response->text);
             return response()->json([
                 'text' => $response->text,
                 'conversation_id' => $conversationId
