@@ -35,7 +35,7 @@ class CardTool extends Tool
         //Busca informação sobre a cobrança do cliente
         $url = env('CLIENT_API_BASE_URL').'/tsmadesao/beneficiario';
         $data = ['cpf' => $cpf, 'kw' => $kw];
-        ds('data: ' , $data);
+
         $responseDataClient = $this->apiService->apiConsumer($data, $url);
 
         if ($responseDataClient['success']){
@@ -69,7 +69,7 @@ class CardTool extends Tool
 
                         $response .= "\n";
                     }
-                    ds('Response Beneficiarios: ' , $response);
+
                     return $response;
                 }
 

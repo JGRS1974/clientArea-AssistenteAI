@@ -72,7 +72,7 @@ class AIAssistantMultipleInputController extends Controller
             if (!$userInput) {
                 return response()->json(['error' => 'Falha ao processar entrada'], 400);
             }
-            ds(['Input' => $userInput]);
+            //ds(['Input' => $userInput]);
 
             // Adiciona mensagem do usuário à conversa
             //$this->conversationService->addMessage($conversationId, 'user', $userInput);
@@ -80,7 +80,7 @@ class AIAssistantMultipleInputController extends Controller
 
             // Gera resposta da AI
             $response = $this->generateAIResponse($conversationId, $kw);
-            ds(['Response AI' => $response]);
+            //ds(['Response AI' => $response]);
             // Adiciona resposta da AI à conversa
             //$this->conversationService->addMessage($conversationId, 'assistant', $response);
             $this->redisConversationService->addMessage($conversationId,'assistant', $response);
