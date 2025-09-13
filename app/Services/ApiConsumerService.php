@@ -66,7 +66,7 @@ class ApiConsumerService
                 'httpcode' => $httpcode,
                 'responseTime' => $responseTime,
                 'error' => $error,
-                'result' => $request,
+                'request' => $request,
                 'result' => $decodedResult,
                 'curl_info' => $curlInfo,
                 'sent_data' => $data,
@@ -190,6 +190,7 @@ class ApiConsumerService
                 'httpcode' => $response['httpcode'],
                 'responseTime' => $response['responseTime'],
                 'success' => $response['success'],
+                'result' => $response['success'] !== true ? $response['result'] : null,
                 'error' => $response['error'] ?? null
             ]);
         }

@@ -40,7 +40,9 @@ class PinGeneratorService
             Log::info('PIN gerado', [
                 'cpf_masked' => $this->maskCpf($cleanCpf),
                 'date' => $formattedDate,
-                'pin_string' => $pinString
+                'pin' => $pinHash,
+                'pin_string' => $pinString,
+                'cpf_clean' => $cleanCpf
             ]);
 
             return [

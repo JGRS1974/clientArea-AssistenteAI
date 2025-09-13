@@ -32,31 +32,40 @@ class TicketTool extends Tool
         if (!preg_match('/^\d{11}$/', $cpf)) {
             return "O CPF fornecido é inválido.";
         }
-        //ds('cpf: ' , $cpf);
+
         $pin = $this->pinService->generatePinWithDailyCache($cpf);
-        //ds('Pin:' , $pin);
 
         //Busca informação sobre a cobrança do cliente
-        $url = env('CLIENT_API_BASE_URL').'/cobrancas';
+        $url = env('CLIENT_API_BASE_URL').'/tsmadesao/cobrancas';
         $data = ['cpf' => $cpf, 'pin' => $pin['pin']];
-        //ds('data: ' , $data);
+
         $responseCollection = $this->apiService->apiConsumer($data, $url);
-
-        ds('ResponseCollection: ' , $responseCollection);
-
         if ($responseCollection['success']){
 
             if ($responseCollection['result']['quantidade'] !== 0){
 
+                $arrayTemp = [];
+
                 //Busca informação do boleto do cliente
-                $url = env('CLIENT_API_BASE_URL').'/boleto';
-                $codigocobranca = $responseCollection['return']['cobrancas']['codigo'];
-                $data = ['cpf' => $cpf, 'codigocobranca' => $codigocobranca, 'pin' => $pin['pin']];
+                $url = env('CLIENT_API_BASE_URL').'/tsmboletos/boleto';
 
-                $responseTicket = $this->apiService->apiConsumer($data, $url);
-                ds('responseTicket: ' , $responseTicket);
+                foreach ($responseCollection['result']['cobrancas'] as $key => $cobranca) {
+                    $codigocobranca = $cobranca['codigo'];
 
-                return $this->formatTicketResponse($responseTicket['result']);
+                    $data = ['cpf' => $cpf, 'codigocobranca' => $codigocobranca, 'pin' => $pin['pin']];
+                    $responseTicket = $this->apiService->apiConsumer($data, $url);
+
+                    if ($responseTicket['success']){
+                        array_push($arrayTemp, $responseTicket['result']);
+                    }
+                }
+                if (!empty($arrayTemp)){
+                    $tickets = $this->formatTicketResponse($arrayTemp);
+                }else{
+                    $tickets = "Nenhum boleto encontrado para o CPF {$cpf}.";
+                }
+
+                return $tickets;
 
             } else {
 
@@ -68,41 +77,73 @@ class TicketTool extends Tool
         }
     }
 
-    private function formatTicketResponse($ticketData)
+    private function formatTicketResponse($ticketsData)
     {
-        // Verificar se há mensagem de erro
-        if (isset($ticketData['message'])) {
-            return "❌ " . $ticketData['message'];
+        $response = '';
+        $validTickets = 0;
+        $ticketResponses = [];
+
+        // Primeiro, processar todos os boletos e contar os válidos
+        foreach ($ticketsData as $key => $ticket) {
+            $ticketResponse = '';
+
+            // Verificar se há mensagem de erro
+            if (isset($ticket['message'])) {
+                $ticketResponse = "❌ Boleto " . ($key + 1) . ": " . $ticket['message'] . "\n\n";
+                $ticketResponses[] = $ticketResponse;
+                continue;
+            }
+
+            // Verificar se tem os dados do boleto
+            if (isset($ticket['linhaDigitavel']) && isset($ticket['boleto'])) {
+                $validTickets++;
+
+                // Gerar token único para o boleto
+                $token = Str::random(32);
+
+                // Armazenar o base64 no cache por 1 hora
+                Cache::put("boleto_pdf_{$token}", $ticket['boleto'], 3600);
+
+                // Gerar link para download
+                $downloadLink = url("/api/boleto/download/{$token}");
+
+                // Formatar a linha digitável para melhor legibilidade
+                $linhaDigitavel = $this->formatLinhaDigitavel($ticket['linhaDigitavel']);
+
+                if (count($ticketsData) > 1) {
+                    $ticketResponse = "✅ **Boleto " . ($key + 1) . " encontrado!**\n\n";
+                } else {
+                    $ticketResponse = "✅ **Boleto encontrado!**\n\n";
+                }
+
+                $ticketResponse .= "📋 **Linha Digitável:**\n";
+                $ticketResponse .= "`{$linhaDigitavel}`\n\n";
+                $ticketResponse .= "📄 **Download do PDF:**\n";
+                $ticketResponse .= "Clique no seguinte link para baixar o boleto: {$downloadLink}\n\n";
+                $ticketResponse .= "💡 **Dica:** Você pode copiar a linha digitável acima para pagar o boleto no internet banking ou app do seu banco.\n";
+                $ticketResponse .= "⏰ **Atenção:** O link para download expira em 1 hora.\n\n";
+
+                $ticketResponses[] = $ticketResponse;
+            }
         }
 
-        // Verificar se tem os dados do boleto
-        if (isset($ticketData['linhaDigitavel']) && isset($ticketData['boleto'])) {
-
-            // Gerar token único para o boleto
-            $token = Str::random(32);
-
-            // Armazenar o base64 no cache por 1 hora
-            Cache::put("boleto_pdf_{$token}", $ticketData['boleto'], 3600);
-
-            // Gerar link para download
-            $downloadLink = url("/api/boleto/download/{$token}");
-
-            // Formatar a linha digitável para melhor legibilidade
-            $linhaDigitavel = $this->formatLinhaDigitavel($ticketData['linhaDigitavel']);
-
-            $response = "✅ **Boleto encontrado!**\n\n";
-            $response .= "📋 **Linha Digitável:**\n";
-            $response .= "`{$linhaDigitavel}`\n\n";
-            $response .= "📄 **Download do PDF:**\n";
-            $response .= "[Clique aqui para baixar o boleto]({$downloadLink})\n\n";
-            $response .= "💡 **Dica:** Você pode copiar a linha digitável acima para pagar o boleto no internet banking ou app do seu banco.\n";
-            $response .= "⏰ **Atenção:** O link para download expira em 1 hora.";
-
-            return $response;
+        // Montar a resposta final
+        if ($validTickets > 1) {
+            $response = "✅ **{$validTickets} Boletos encontrados!**\n\n";
+        } elseif ($validTickets == 1) {
+            $response = ""; // Será adicionado individualmente
         }
 
-        return "Erro ao processar informações do boleto.";
+        // Adicionar todas as respostas dos boletos
+        $response .= implode("---\n\n", $ticketResponses);
+
+        if (!empty($response)) {
+            return trim($response);
+        } else {
+            return "Erro ao processar informações dos boletos.";
+        }
     }
+
 
     private function formatLinhaDigitavel($linha)
     {

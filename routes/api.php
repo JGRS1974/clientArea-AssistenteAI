@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Api\BilletController;
 use App\Http\Controllers\Api\AIAssistantController;
 use App\Http\Controllers\Api\ConversationController;
+use App\Http\Controllers\Api\AIAssistantMultipleInputController;
 
 //Route::get('/user', function (Request $request) {
 //    return $request->user();
@@ -14,7 +15,8 @@ use App\Http\Controllers\Api\ConversationController;
 //Route::middleware(['throttle:120,1'])->group(function () {
 
     // Endpoint principal para chat com AI
-    Route::post('/chat', [AIAssistantController::class, 'chat']);
+    //Route::post('/chat', [AIAssistantController::class, 'chat']);
+    Route::post('/chat', [AIAssistantMultipleInputController::class, 'chat']);
 
     Route::get('/boleto/download/{token}', [BilletController::class, 'downloadPdf'])->name('boleto.download');
 

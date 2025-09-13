@@ -60,6 +60,17 @@ return [
             'report' => false,
         ],
 
+        'private_files' => [
+        'driver' => 'local',
+        'root' => storage_path('app/audio'),
+
+        ],
+
+        'private_images' => [
+        'driver' => 'local',
+        'root' => storage_path('app/image'),
+
+        ],
     ],
 
     /*
