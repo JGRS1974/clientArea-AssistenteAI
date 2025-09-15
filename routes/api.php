@@ -31,25 +31,29 @@ use App\Http\Controllers\Api\AIAssistantMultipleInputController;
     });
 
     // Health check
-    Route::get('/health', function() {
-        //try {
-        //    $redis = Redis::connection();
-        //    $redis->ping();
-        //    return response()->json([
-        //        'status' => 'ok',
-        //        'redis' => 'connected',
-        //        'timestamp' => now()
-        //    ]);
-        //} catch (\Exception $e) {
-        //    return response()->json([
-        //        'status' => 'error',
-        //        'redis' => 'disconnected',
-        //        'error' => $e->getMessage()
-        //    ], 500);
-        //}
-        return response()->json([
-            'status' => 'ok',
-            'timestamp' => now()
-        ]);
+    Route::get('/health-redis', function() {
+        try {
+            $redis = Redis::connection();
+            $redis->ping();
+            return response()->json([
+                'status' => 'ok',
+                'redis' => 'connected',
+                'timestamp' => now()
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'status' => 'error',
+                'redis' => 'disconnected',
+                'error' => $e->getMessage()
+            ], 500);
+        }
+    });
+
+    Route::get('/teste-redis', function () {
+        return [
+            'host' => env('NF_REDISASSISTENTE_HOST'),
+            'password' => env('NF_REDISASSISTENTE_PASSWORD'),
+            'port' => env('NF_REDISASSISTENTE_PORT'),
+        ];
     });
 //});
