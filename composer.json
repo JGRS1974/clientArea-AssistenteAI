@@ -10,6 +10,7 @@
         "laravel/framework": "^12.0",
         "laravel/sanctum": "^4.0",
         "laravel/tinker": "^2.10.1",
+        "predis/predis": "^3.2",
         "prism-php/prism": "^0.86.0",
         "spatie/pdf-to-text": "^1.54"
     },
