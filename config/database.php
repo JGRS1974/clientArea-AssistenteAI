@@ -175,6 +175,7 @@ return [
             'port' => env('NF_REDISASSISTENTE_PORT'),
             'database' => 0,
             'prefix' => 'conversations:',
+            'scheme' => 'tls',
         ],
 
     ],
