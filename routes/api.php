@@ -33,8 +33,9 @@ use App\Http\Controllers\Api\AIAssistantMultipleInputController;
     // Health check
     Route::get('/health-redis', function() {
         try {
-            $redis = Redis::connection();
+            $redis = Redis::connection('conversations');
             $redis->ping();
+
             return response()->json([
                 'status' => 'ok',
                 'redis' => 'connected',
