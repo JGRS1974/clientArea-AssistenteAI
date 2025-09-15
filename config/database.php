@@ -170,12 +170,12 @@ return [
         ],
 
         'conversations' => [
-            'host' => env('NF_REDISASSISTENTE_HOST', '127.0.0.1'),
-            'password' => env('NF_REDISASSISTENTE_PASSWORD', null),
-            'port' => env('NF_REDISASSISTENTE_PORT', '6379'),
+            'host' => env('NF_REDISASSISTENTE_HOST'),
+            'password' => env('NF_REDISASSISTENTE_PASSWORD'),
+            'port' => env('NF_REDISASSISTENTE_PORT'),
             'database' => 0,
             'prefix' => 'conversations:',
-        ]
+        ],
 
     ],
 
