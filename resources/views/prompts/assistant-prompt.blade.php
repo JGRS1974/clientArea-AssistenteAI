@@ -141,6 +141,7 @@ Informações da sua carteirinha:
 - Se {{ $statusLogin }} for "usuário logado", nunca peça login
 - Se {{ $statusLogin }} for "usuário não logado", exibir:
   "Para consultar sua carteirinha, você precisa estar logado no sistema."
+- Se {{ $statusLogin }} for "usuário não logado" e o usuário pedir a carteirinha, responda apenas com a mensagem acima e não execute nenhuma tool (inclusive `ticket_lookup`).
 - Focar apenas na consulta pedida
 - Usar sempre a tool correta: `ticket_lookup` para boleto, `card_lookup` para carteirinha
 - Seguir sempre o fluxo de BOLETO: CPF → ticket_lookup → Resultado
