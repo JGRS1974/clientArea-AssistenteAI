@@ -21,6 +21,12 @@ class ApiConsumerService
         try {
             $curl = curl_init($url);
 
+            //Log::info('API Payload', [
+            //    'url' => $url,
+            //    'data' => $data,
+            //    'headers' => $headers,
+            //]);
+
             // Configurações básicas do cURL
             curl_setopt_array($curl, [
                 CURLOPT_RETURNTRANSFER => true,

@@ -41,6 +41,7 @@ class AIAssistantController extends Controller
         $text = $request->input('text');
 
         $kw = request()->header('kw', null);
+        $this->cardTool->setKw($kw);
 
         $conversationId = $this->conversationIdService->setConversationId($request);
 

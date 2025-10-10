@@ -4,6 +4,7 @@ namespace App\Tools;
 
 use Exception;
 use Prism\Prism\Tool;
+use Illuminate\Support\Facades\Log;
 use App\Services\ApiConsumerService;
 use App\Services\PinGeneratorService;
 
@@ -11,25 +12,38 @@ class CardTool extends Tool
 {
     private $apiService;
     protected $pinService;
+    private ?string $kw = null;
 
     public function __construct(ApiConsumerService $apiService, PinGeneratorService $pinService )
     {
         $this->as('card_lookup')
             ->for('Recupera informação da carterinha do cliente pelo CPF informado e após o cliente fazer login no sistema para obter a chave de acesso.')
             ->withStringParameter('cpf', 'CPF do cliente')
-            ->withStringParameter('kw', 'Chave de acesso do cliente após fazer login no sistema. ')
             ->using($this);
 
         $this->apiService = $apiService;
         $this->pinService = $pinService;
     }
 
-    public function __invoke(string $cpf, string $kw)
+    public function setKw(?string $kw): self
+    {
+        $this->kw = $kw;
+
+        return $this;
+    }
+
+    public function __invoke(string $cpf, ?string $kw = null)
     {
         // Chamada API Corpe
 
         if (!preg_match('/^\d{11}$/', $cpf)) {
             return "O CPF fornecido é inválido.";
+        }
+        $kw = $kw ?? $this->kw;
+
+        if (empty($kw)) {
+            Log::warning('CardTool executada sem kw.');
+            return "Não foi possível consultar a informação da carterinha porque o acesso não foi confirmado.";
         }
 
         //Busca informação sobre a cobrança do cliente

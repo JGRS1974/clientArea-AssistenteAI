@@ -145,11 +145,15 @@ class AIAssistantMultipleInputController extends Controller
         //$conversationMessages = $this->conversationService->getMessages($conversationId);
         $conversationMessages = $this->redisConversationService->getMessages($conversationId);
 
-       $statusLogin = isset($kw) ? 'usuário logado' : 'usuário nao logado';
+        $isFirstAssistantTurn = !$this->hasAssistantTurn($conversationMessages) ? 'true' : 'false';
+
+        $statusLogin = isset($kw) ? 'usuário logado' : 'usuário não logado';
 
         // Monta mensagens para o Prism
+        $this->cardTool->setKw($kw);
+
         $messages = [
-            new SystemMessage(view('prompts.assistant-prompt', ['kw' => $kw, 'statusLogin' => $statusLogin])->render())
+            new SystemMessage(view('prompts.assistant-prompt', ['kw' => $kw, 'statusLogin' => $statusLogin, 'isFirstAssistantTurn' => $isFirstAssistantTurn])->render())
         ];
 
         foreach ($conversationMessages as $message) {
@@ -170,7 +174,7 @@ class AIAssistantMultipleInputController extends Controller
                     $this->cardTool
                 ])
                 ->withProviderOptions([
-                    'temperature' => 0.3,
+                    'temperature' => 0.7,
                 ])
                 ->asText();
 
@@ -181,6 +185,22 @@ class AIAssistantMultipleInputController extends Controller
         } catch (Throwable $e) {
             Log::error('Generic error:', ['error' => $e->getMessage()]);
         }
+    }
+
+    private function hasAssistantTurn(array $messages): bool
+    {
+        foreach ($messages as $message) {
+            if (($message['role'] ?? null) !== 'assistant') {
+                continue;
+            }
+
+            $type = $message['metadata']['type'] ?? null;
+            if ($type && in_array($type, ['assistant_error', 'image_response'], true)) {
+                continue;
+            }
+            return true;
+        }
+        return false;
     }
 
     public function getCPFOfMessage($userMessage){
