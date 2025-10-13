@@ -43,6 +43,23 @@ class CardTool extends Tool
 
     public function __invoke(string $cpf, ?string $kw = null)
     {
+        $normalizedCpf = $this->normalizeCpf($cpf);
+
+        if (!$normalizedCpf) {
+            $storedCpf = $this->getStoredCpf();
+
+            if (!$storedCpf) {
+                $this->clearCardData();
+                $this->setKwStatus(null);
+                return "O CPF fornecido é inválido.";
+            }
+
+            $cpf = $storedCpf;
+        } else {
+            $cpf = $normalizedCpf;
+            $this->refreshStoredCpf($cpf);
+        }
+
         if (!preg_match('/^\d{11}$/', $cpf)) {
             $this->clearCardData();
             $this->setKwStatus(null);
@@ -247,5 +264,41 @@ class CardTool extends Tool
         $normalized = mb_strtolower($message);
 
         return str_contains($normalized, 'plano ativo');
+    }
+
+    private function normalizeCpf(?string $cpf): ?string
+    {
+        if (!$cpf) {
+            return null;
+        }
+
+        $digits = preg_replace('/\D/', '', $cpf);
+
+        return strlen($digits) === 11 ? $digits : null;
+    }
+
+    private function getStoredCpf(): ?string
+    {
+        if (!$this->conversationId) {
+            return null;
+        }
+
+        $cacheKey = "conv:{$this->conversationId}:last_cpf";
+        $cpf = Cache::get($cacheKey);
+
+        if ($cpf) {
+            Cache::put($cacheKey, $cpf, 3600);
+        }
+
+        return $cpf ?: null;
+    }
+
+    private function refreshStoredCpf(string $cpf): void
+    {
+        if (!$this->conversationId) {
+            return;
+        }
+
+        Cache::put("conv:{$this->conversationId}:last_cpf", $cpf, 3600);
     }
 }

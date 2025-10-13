@@ -51,6 +51,51 @@ class RedisConversationService
         }, array_reverse($messages)); // Reverse para ordem cronológica
     }
 
+    public function setMetadata(string $sessionId, array $metadata): void
+    {
+        $metaKey = "messages:{$sessionId}:meta";
+
+        if (empty($metadata)) {
+            return;
+        }
+
+        $this->conversationRedis->hmset($metaKey, $metadata);
+    }
+
+    public function setMetadataField(string $sessionId, string $field, mixed $value): void
+    {
+        $metaKey = "messages:{$sessionId}:meta";
+        $this->conversationRedis->hset($metaKey, $field, $value);
+    }
+
+    public function getMetadata(string $sessionId): array
+    {
+        $metaKey = "messages:{$sessionId}:meta";
+        $data = $this->conversationRedis->hgetall($metaKey);
+
+        return is_array($data) ? $data : [];
+    }
+
+    public function getMetadataField(string $sessionId, string $field, mixed $default = null): mixed
+    {
+        $metaKey = "messages:{$sessionId}:meta";
+        $value = $this->conversationRedis->hget($metaKey, $field);
+
+        return $value !== null ? $value : $default;
+    }
+
+    public function forgetMetadata(string $sessionId, array $fields = []): void
+    {
+        $metaKey = "messages:{$sessionId}:meta";
+
+        if (empty($fields)) {
+            $this->conversationRedis->del($metaKey);
+            return;
+        }
+
+        $this->conversationRedis->hdel($metaKey, ...$fields);
+    }
+
 
     /**
      * Limpa a conversa

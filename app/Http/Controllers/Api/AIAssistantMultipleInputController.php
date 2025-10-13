@@ -81,6 +81,11 @@ class AIAssistantMultipleInputController extends Controller
             }
             //ds(['Input' => $userInput]);
 
+            $detectedCpf = $this->extractCpf($userInput);
+            if ($detectedCpf) {
+                $this->storeLastCpf($conversationId, $detectedCpf);
+            }
+
             // Adiciona mensagem do usuário à conversa
             //$this->conversationService->addMessage($conversationId, 'user', $userInput);
             $this->redisConversationService->addMessage($conversationId,'user', $userInput);
@@ -153,6 +158,8 @@ class AIAssistantMultipleInputController extends Controller
 
         $isFirstAssistantTurn = !$this->hasAssistantTurn($conversationMessages) ? 'true' : 'false';
 
+        $storedCpf = $this->getStoredCpf($conversationId);
+
         $kwStatusKey = $this->getConversationCacheKey($conversationId, 'kw_status');
         $kwStatus = Cache::get($kwStatusKey);
 
@@ -167,6 +174,7 @@ class AIAssistantMultipleInputController extends Controller
                 'statusLogin' => $statusLogin,
                 'isFirstAssistantTurn' => $isFirstAssistantTurn,
                 'kwStatus' => $kwStatus,
+                'hasStoredCpf' => $storedCpf ? 'true' : 'false',
             ])->render())
         ];
 
@@ -279,6 +287,51 @@ class AIAssistantMultipleInputController extends Controller
         return "conv:{$conversationId}:{$suffix}";
     }
 
+    private function extractCpf(string $text): ?string
+    {
+        if (preg_match('/\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/', $text, $matches)) {
+            $cpf = preg_replace('/\D/', '', $matches[0]);
+            return strlen($cpf) === 11 ? $cpf : null;
+        }
+
+        return null;
+    }
+
+    private function storeLastCpf(string $conversationId, string $cpf): void
+    {
+        $normalized = preg_replace('/\D/', '', $cpf);
+
+        if (strlen($normalized) !== 11) {
+            return;
+        }
+
+        $cacheKey = $this->getConversationCacheKey($conversationId, 'last_cpf');
+        Cache::put($cacheKey, $normalized, 3600);
+
+        $this->redisConversationService->setMetadataField($conversationId, 'last_cpf', $normalized);
+        $this->redisConversationService->setMetadataField($conversationId, 'last_cpf_at', now()->toISOString());
+    }
+
+    private function getStoredCpf(string $conversationId): ?string
+    {
+        $cacheKey = $this->getConversationCacheKey($conversationId, 'last_cpf');
+        $cpf = Cache::get($cacheKey);
+
+        if ($cpf && strlen($cpf) === 11) {
+            Cache::put($cacheKey, $cpf, 3600);
+            return $cpf;
+        }
+
+        $metaCpf = $this->redisConversationService->getMetadataField($conversationId, 'last_cpf');
+
+        if ($metaCpf && strlen($metaCpf) === 11) {
+            Cache::put($cacheKey, $metaCpf, 3600);
+            return $metaCpf;
+        }
+
+        return null;
+    }
+
     private function hasAssistantTurn(array $messages): bool
     {
         foreach ($messages as $message) {
@@ -295,14 +348,4 @@ class AIAssistantMultipleInputController extends Controller
         return false;
     }
 
-    public function getCPFOfMessage($userMessage){
-
-        $regex = '/\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/';
-
-        if (preg_match($regex, $userMessage, $matches)) {
-            $cpf = preg_replace('/\D/', '', $matches[0]);
-        } else {
-            $cpf = null;
-        }
-    }
 }

@@ -37,6 +37,22 @@ class TicketTool extends Tool
     {
         // Chamada API Corpe
 
+        $normalizedCpf = $this->normalizeCpf($cpf);
+
+        if (!$normalizedCpf) {
+            $storedCpf = $this->getStoredCpf();
+
+            if (!$storedCpf) {
+                $this->clearTicketData();
+                return "O CPF fornecido é inválido.";
+            }
+
+            $cpf = $storedCpf;
+        } else {
+            $cpf = $normalizedCpf;
+            $this->refreshStoredCpf($cpf);
+        }
+
         if (!preg_match('/^\d{11}$/', $cpf)) {
             $this->clearTicketData();
             return "O CPF fornecido é inválido.";
@@ -156,5 +172,41 @@ class TicketTool extends Tool
 
         Cache::forget("conv:{$this->conversationId}:boletos");
         Cache::forget("conv:{$this->conversationId}:last_tool");
+    }
+
+    private function normalizeCpf(?string $cpf): ?string
+    {
+        if (!$cpf) {
+            return null;
+        }
+
+        $digits = preg_replace('/\D/', '', $cpf);
+
+        return strlen($digits) === 11 ? $digits : null;
+    }
+
+    private function getStoredCpf(): ?string
+    {
+        if (!$this->conversationId) {
+            return null;
+        }
+
+        $cacheKey = "conv:{$this->conversationId}:last_cpf";
+        $cpf = Cache::get($cacheKey);
+
+        if ($cpf) {
+            Cache::put($cacheKey, $cpf, 3600);
+        }
+
+        return $cpf ?: null;
+    }
+
+    private function refreshStoredCpf(string $cpf): void
+    {
+        if (!$this->conversationId) {
+            return;
+        }
+
+        Cache::put("conv:{$this->conversationId}:last_cpf", $cpf, 3600);
     }
 }
