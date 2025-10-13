@@ -9,6 +9,7 @@ use App\Tools\TicketTool;
 use Illuminate\Http\Request;
 use Prism\Prism\Enums\Provider;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 use App\Http\Controllers\Controller;
 use App\Services\ConversationIdService;
 use App\Services\ConversationService;
@@ -62,9 +63,15 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         $conversationId = $this->conversationIdService->setConversationId($request);
+        $kw = $request->header('kw', null);
+
+        $this->syncKwStatusWithHeader($conversationId, $kw);
+        $this->ticketTool->setConversationId($conversationId);
+        $this->cardTool->setConversationId($conversationId);
+        $this->resetConversationToolState($conversationId);
 
         //Verifica se foi enviada a chave de acesso no sistema após login
-        $kw = request()->header('kw', null);
+        // já obtido anteriormente
 
         try {
             // Processa a entrada do usuário
@@ -85,10 +92,9 @@ class AIAssistantMultipleInputController extends Controller
             //$this->conversationService->addMessage($conversationId, 'assistant', $response);
             $this->redisConversationService->addMessage($conversationId,'assistant', $response);
 
-            return response()->json([
-                'text' => $response,
-                'conversation_id' => $conversationId
-            ]);
+            $payload = $this->buildResponsePayload($conversationId, $response);
+
+            return response()->json($payload);
 
         } catch (PrismException $e) {
             Log::error('AI generation failed:', ['error' => $e->getMessage()]);
@@ -147,13 +153,21 @@ class AIAssistantMultipleInputController extends Controller
 
         $isFirstAssistantTurn = !$this->hasAssistantTurn($conversationMessages) ? 'true' : 'false';
 
-        $statusLogin = isset($kw) ? 'usuário logado' : 'usuário não logado';
+        $kwStatusKey = $this->getConversationCacheKey($conversationId, 'kw_status');
+        $kwStatus = Cache::get($kwStatusKey);
+
+        $statusLogin = $this->resolveStatusLogin($kw, $kwStatus);
 
         // Monta mensagens para o Prism
         $this->cardTool->setKw($kw);
 
         $messages = [
-            new SystemMessage(view('prompts.assistant-prompt', ['kw' => $kw, 'statusLogin' => $statusLogin, 'isFirstAssistantTurn' => $isFirstAssistantTurn])->render())
+            new SystemMessage(view('prompts.assistant-prompt', [
+                'kw' => $kw,
+                'statusLogin' => $statusLogin,
+                'isFirstAssistantTurn' => $isFirstAssistantTurn,
+                'kwStatus' => $kwStatus,
+            ])->render())
         ];
 
         foreach ($conversationMessages as $message) {
@@ -174,7 +188,10 @@ class AIAssistantMultipleInputController extends Controller
                     $this->cardTool
                 ])
                 ->withProviderOptions([
-                    'temperature' => 0.7,
+                    'temperature' => 0.85,
+                    'top_p' => 0.9,
+                    'frequency_penalty' => 0.3,
+                    'presence_penalty' => 0.2,
                 ])
                 ->asText();
 
@@ -185,6 +202,81 @@ class AIAssistantMultipleInputController extends Controller
         } catch (Throwable $e) {
             Log::error('Generic error:', ['error' => $e->getMessage()]);
         }
+    }
+
+    private function resolveStatusLogin(?string $kw, ?string $kwStatus): string
+    {
+        if (empty($kw)) {
+            return 'usuário não logado';
+        }
+
+        if (($kwStatus ?? null) === 'invalid') {
+            return 'usuário não logado';
+        }
+
+        return 'usuário logado';
+    }
+
+    private function syncKwStatusWithHeader(string $conversationId, ?string $kw): void
+    {
+        $statusKey = $this->getConversationCacheKey($conversationId, 'kw_status');
+        $hashKey = $this->getConversationCacheKey($conversationId, 'kw_hash');
+
+        if ($kw) {
+            $currentHash = hash('sha256', $kw);
+            $storedHash = Cache::get($hashKey);
+
+            if ($storedHash && $storedHash !== $currentHash) {
+                Cache::forget($statusKey);
+            }
+
+            Cache::put($hashKey, $currentHash, 3600);
+            return;
+        }
+
+        Cache::forget($hashKey);
+        Cache::forget($statusKey);
+    }
+
+    private function buildResponsePayload(string $conversationId, ?string $responseText): array
+    {
+        $payload = [
+            'text' => $responseText ?? '',
+            'conversation_id' => $conversationId,
+        ];
+
+        $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
+        $lastTool = Cache::get($lastToolKey);
+
+        if ($lastTool === 'ticket') {
+            $ticketsKey = $this->getConversationCacheKey($conversationId, 'boletos');
+            $tickets = Cache::get($ticketsKey);
+            if (is_array($tickets)) {
+                $payload['boletos'] = $tickets;
+            }
+            Cache::forget($ticketsKey);
+        } elseif ($lastTool === 'card') {
+            $beneficiariesKey = $this->getConversationCacheKey($conversationId, 'beneficiarios');
+            $beneficiaries = Cache::get($beneficiariesKey);
+            if (is_array($beneficiaries)) {
+                $payload['beneficiarios'] = $beneficiaries;
+            }
+            Cache::forget($beneficiariesKey);
+        }
+
+        Cache::forget($lastToolKey);
+
+        return $payload;
+    }
+
+    private function resetConversationToolState(string $conversationId): void
+    {
+        Cache::forget($this->getConversationCacheKey($conversationId, 'last_tool'));
+    }
+
+    private function getConversationCacheKey(string $conversationId, string $suffix): string
+    {
+        return "conv:{$conversationId}:{$suffix}";
     }
 
     private function hasAssistantTurn(array $messages): bool

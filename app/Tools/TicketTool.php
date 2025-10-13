@@ -13,6 +13,7 @@ class TicketTool extends Tool
 {
     private $apiService;
     protected $pinService;
+    protected ?string $conversationId = null;
 
     public function __construct(ApiConsumerService $apiService, PinGeneratorService $pinService )
     {
@@ -25,13 +26,23 @@ class TicketTool extends Tool
         $this->pinService = $pinService;
     }
 
+    public function setConversationId(?string $conversationId): self
+    {
+        $this->conversationId = $conversationId;
+
+        return $this;
+    }
+
     public function __invoke(string $cpf)
     {
         // Chamada API Corpe
 
         if (!preg_match('/^\d{11}$/', $cpf)) {
+            $this->clearTicketData();
             return "O CPF fornecido é inválido.";
         }
+
+        $this->clearTicketData();
 
         $pin = $this->pinService->generatePinWithDailyCache($cpf);
 
@@ -62,42 +73,42 @@ class TicketTool extends Tool
                 if (!empty($arrayTemp)){
                     $tickets = $this->formatTicketResponse($arrayTemp);
                 }else{
-                    $tickets = "Nenhum boleto encontrado para o CPF {$cpf}.";
+                    $tickets = [];
                 }
 
-                return $tickets;
+                $this->storeTicketData($tickets);
+
+                if (!empty($tickets)) {
+                    $count = count($tickets);
+                    return $count > 1
+                        ? "Boletos encontrados: {$count}. Lista pronta para exibição."
+                        : "Boleto encontrado. Lista pronta para exibição.";
+                }
+
+                return "Nenhum boleto encontrado para o CPF {$cpf}.";
 
             } else {
 
+                $this->storeTicketData([]);
                 return "Nenhum boleto encontrado para o CPF {$cpf}.";
             }
         }else{
 
+            $this->clearTicketData();
             return "Não foi possível consultar o boleto para o CPF {$cpf}, ocorreu um erro técnico.";
         }
     }
 
     private function formatTicketResponse($ticketsData)
     {
-        $response = '';
-        $validTickets = 0;
-        $ticketResponses = [];
+        $tickets = [];
 
-        // Primeiro, processar todos os boletos e contar os válidos
-        foreach ($ticketsData as $key => $ticket) {
-            $ticketResponse = '';
-
-            // Verificar se há mensagem de erro
+        foreach ($ticketsData as $ticket) {
             if (isset($ticket['message'])) {
-                $ticketResponse = "❌ Boleto " . ($key + 1) . ": " . $ticket['message'] . "\n\n";
-                $ticketResponses[] = $ticketResponse;
                 continue;
             }
 
-            // Verificar se tem os dados do boleto
             if (isset($ticket['linhaDigitavel']) && isset($ticket['boleto'])) {
-                $validTickets++;
-
                 // Gerar token único para o boleto
                 $token = Str::random(32);
 
@@ -107,41 +118,14 @@ class TicketTool extends Tool
                 // Gerar link para download
                 $downloadLink = url("/api/boleto/download/{$token}");
 
-                // Formatar a linha digitável para melhor legibilidade
-                $linhaDigitavel = $this->formatLinhaDigitavel($ticket['linhaDigitavel']);
-
-                if (count($ticketsData) > 1) {
-                    $ticketResponse = "✅ **Boleto " . ($key + 1) . " encontrado!**\n\n";
-                } else {
-                    $ticketResponse = "✅ **Boleto encontrado!**\n\n";
-                }
-
-                $ticketResponse .= "📋 **Linha Digitável:**\n";
-                $ticketResponse .= "`{$linhaDigitavel}`\n\n";
-                $ticketResponse .= "📄 **Download do PDF:**\n";
-                $ticketResponse .= "Clique no seguinte link para baixar o boleto: {$downloadLink}\n\n";
-                $ticketResponse .= "💡 **Dica:** Você pode copiar a linha digitável acima para pagar o boleto no internet banking ou app do seu banco.\n";
-                $ticketResponse .= "⏰ **Atenção:** O link para download expira em 1 hora.\n\n";
-
-                $ticketResponses[] = $ticketResponse;
+                $tickets[] = [
+                    'linha_digitavel' => $this->formatLinhaDigitavel($ticket['linhaDigitavel']),
+                    'link' => $downloadLink,
+                ];
             }
         }
 
-        // Montar a resposta final
-        if ($validTickets > 1) {
-            $response = "✅ **{$validTickets} Boletos encontrados!**\n\n";
-        } elseif ($validTickets == 1) {
-            $response = ""; // Será adicionado individualmente
-        }
-
-        // Adicionar todas as respostas dos boletos
-        $response .= implode("---\n\n", $ticketResponses);
-
-        if (!empty($response)) {
-            return trim($response);
-        } else {
-            return "Erro ao processar informações dos boletos.";
-        }
+        return $tickets;
     }
 
 
@@ -154,4 +138,23 @@ class TicketTool extends Tool
                            str_replace(['.', ' '], '', $linha));
     }
 
+    private function storeTicketData(array $tickets): void
+    {
+        if (!$this->conversationId) {
+            return;
+        }
+
+        Cache::put("conv:{$this->conversationId}:boletos", $tickets, 3600);
+        Cache::put("conv:{$this->conversationId}:last_tool", 'ticket', 3600);
+    }
+
+    private function clearTicketData(): void
+    {
+        if (!$this->conversationId) {
+            return;
+        }
+
+        Cache::forget("conv:{$this->conversationId}:boletos");
+        Cache::forget("conv:{$this->conversationId}:last_tool");
+    }
 }

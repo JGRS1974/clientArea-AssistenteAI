@@ -2,9 +2,10 @@
 
 namespace App\Tools;
 
-use Exception;
 use Prism\Prism\Tool;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Arr;
 use App\Services\ApiConsumerService;
 use App\Services\PinGeneratorService;
 
@@ -13,6 +14,7 @@ class CardTool extends Tool
     private $apiService;
     protected $pinService;
     private ?string $kw = null;
+    protected ?string $conversationId = null;
 
     public function __construct(ApiConsumerService $apiService, PinGeneratorService $pinService )
     {
@@ -25,6 +27,13 @@ class CardTool extends Tool
         $this->pinService = $pinService;
     }
 
+    public function setConversationId(?string $conversationId): self
+    {
+        $this->conversationId = $conversationId;
+
+        return $this;
+    }
+
     public function setKw(?string $kw): self
     {
         $this->kw = $kw;
@@ -34,67 +43,209 @@ class CardTool extends Tool
 
     public function __invoke(string $cpf, ?string $kw = null)
     {
-        // Chamada API Corpe
-
         if (!preg_match('/^\d{11}$/', $cpf)) {
+            $this->clearCardData();
+            $this->setKwStatus(null);
             return "O CPF fornecido é inválido.";
         }
+
         $kw = $kw ?? $this->kw;
 
         if (empty($kw)) {
             Log::warning('CardTool executada sem kw.');
+            $this->clearCardData();
+            $this->setKwStatus(null);
             return "Não foi possível consultar a informação da carterinha porque o acesso não foi confirmado.";
         }
 
-        //Busca informação sobre a cobrança do cliente
+        $this->clearCardData();
+
         $url = env('CLIENT_API_BASE_URL').'/tsmadesao/beneficiario';
         $data = ['cpf' => $cpf, 'kw' => $kw];
 
         $responseDataClient = $this->apiService->apiConsumer($data, $url);
 
-        if ($responseDataClient['success']){
+        if ($responseDataClient['success']) {
+            $this->setKwStatus('valid', $kw);
+            if (($responseDataClient['result']['quantidade'] ?? 0) !== 0) {
+                $beneficiariesInformation = $this->formatBeneficiaries($responseDataClient['result']['planos'] ?? []);
 
-            if ($responseDataClient['result']['quantidade'] !== 0){
-                $beneficiariesInformation = [];
-                foreach ($responseDataClient['result']['planos'] as $key => $plano) {
-                    foreach ($plano['beneficiarios'] as $key => $beneficiario) {
-                        if ($beneficiario['numerocarteira'] !== ''){
-                            array_push($beneficiariesInformation, $beneficiario);
-                        }
-                    }
+                $this->storeCardData($beneficiariesInformation);
+
+                if (!empty($beneficiariesInformation)) {
+                    return "Carteirinha encontrada. Lista pronta para exibição.";
                 }
-                //ds('Array Beneficiarios: ' , $beneficiariesInformation);
-
-                // Formatar a resposta como string legível
-                if (count($beneficiariesInformation) > 0) {
-                    $response = "Informações da carterinha encontradas:\n\n";
-
-                    foreach ($beneficiariesInformation as $index => $beneficiario) {
-                        $response .= "📋 Beneficiário " . ($index + 1) . ":\n";
-                        $response .= "• Nome: " . $beneficiario['nome'] . "\n";
-                        $response .= "• Tipo: " . $beneficiario['tipo'] . "\n";
-                        $response .= "• CPF: " . $beneficiario['cpf'] . "\n";
-                        $response .= "• Data de Nascimento: " . date('d/m/Y', strtotime($beneficiario['datanascimento'])) . "\n";
-                        $response .= "• Número da Carteira: " . $beneficiario['numerocarteira'] . "\n";
-
-                        if (!empty($beneficiario['numerocarteiraodonto'])) {
-                            $response .= "• Carteira Odonto: " . $beneficiario['numerocarteiraodonto'] . "\n";
-                        }
-
-                        $response .= "\n";
-                    }
-
-                    return $response;
-                }
-
-            } else {
-
-                return "Nenhuma informação da carterinha foi encontrada para o CPF do cliente {$cpf}.";
             }
-        }else{
 
-            return "Não foi possível consultar a informação da carterinha para o CPF do cliente {$cpf}, ocorreu um erro técnico.";
+            $this->storeCardData([]);
+            return "Nenhuma informação da carterinha foi encontrada para o CPF do cliente {$cpf}.";
+        }
+
+        $httpCode = $responseDataClient['httpcode'] ?? null;
+        $errorMessage = $this->extractErrorMessage($responseDataClient);
+
+        if ($this->isKwInvalid($httpCode, $errorMessage)) {
+            $this->setKwStatus('invalid', $kw);
+            $this->clearCardData();
+            return "KW inválida.";
+        }
+
+        if ($this->isNoPlanFound($httpCode, $errorMessage)) {
+            $this->setKwStatus('valid', $kw);
+            $this->storeCardData([]);
+            return "Nenhuma informação da carterinha foi encontrada para o CPF do cliente {$cpf}.";
+        }
+
+        $this->setKwStatus(null);
+        $this->clearCardData();
+        return "Não foi possível consultar a informação da carterinha para o CPF do cliente {$cpf}, ocorreu um erro técnico.";
+    }
+
+    private function formatBeneficiaries(array $planos): array
+    {
+        $beneficiariesInformation = [];
+        $index = 0;
+
+        foreach ($planos as $plano) {
+            $beneficiarios = $plano['beneficiarios'] ?? [];
+
+            foreach ($beneficiarios as $beneficiario) {
+                if (($beneficiario['numerocarteira'] ?? '') === '') {
+                    continue;
+                }
+
+                $beneficiariesInformation[] = [
+                    'id' => $index++,
+                    'nome' => $beneficiario['nome'] ?? '',
+                    'tipo' => $beneficiario['tipo'] ?? '',
+                    'cpf' => $beneficiario['cpf'] ?? '',
+                    'datanascimento' => $this->formatBirthDate($beneficiario['datanascimento'] ?? null),
+                    'numerocarteira' => $beneficiario['numerocarteira'],
+                    'numerocarteiraodonto' => $beneficiario['numerocarteiraodonto'] ?? '',
+                ];
+            }
+        }
+
+        return $beneficiariesInformation;
+    }
+
+    private function formatBirthDate(?string $date): string
+    {
+        if (!$date) {
+            return '';
+        }
+
+        $timestamp = strtotime($date);
+
+        if ($timestamp === false) {
+            return '';
+        }
+
+        return date('Y-m-d', $timestamp);
+    }
+
+    private function storeCardData(array $beneficiaries): void
+    {
+        $dataKey = $this->getCacheKey('beneficiarios');
+        $lastToolKey = $this->getCacheKey('last_tool');
+
+        if (!$dataKey || !$lastToolKey) {
+            return;
+        }
+
+        Cache::put($dataKey, $beneficiaries, 3600);
+        Cache::put($lastToolKey, 'card', 3600);
+    }
+
+    private function clearCardData(): void
+    {
+        $dataKey = $this->getCacheKey('beneficiarios');
+        $lastToolKey = $this->getCacheKey('last_tool');
+
+        if ($dataKey) {
+            Cache::forget($dataKey);
+        }
+
+        if ($lastToolKey) {
+            Cache::forget($lastToolKey);
         }
     }
 
+    private function getCacheKey(string $suffix): ?string
+    {
+        if (!$this->conversationId) {
+            return null;
+        }
+
+        return "conv:{$this->conversationId}:{$suffix}";
+    }
+
+    private function setKwStatus(?string $status, ?string $kwValue = null): void
+    {
+        $statusKey = $this->getCacheKey('kw_status');
+        $hashKey = $this->getCacheKey('kw_hash');
+
+        if (!$statusKey || !$hashKey) {
+            return;
+        }
+
+        if ($status === null) {
+            Cache::forget($statusKey);
+            Cache::forget($hashKey);
+            return;
+        }
+
+        Cache::put($statusKey, $status, 3600);
+
+        if ($kwValue !== null) {
+            Cache::put($hashKey, hash('sha256', $kwValue), 3600);
+        }
+    }
+
+    private function extractErrorMessage(array $response): string
+    {
+        $message = '';
+
+        $result = $response['result'] ?? null;
+
+        if (is_array($result)) {
+            $message = Arr::get($result, 'message')
+                ?? Arr::get($result, 'error')
+                ?? json_encode($result);
+        } elseif (is_string($result) && $result !== '') {
+            $message = $result;
+        }
+
+        if (!$message && !empty($response['request'])) {
+            $message = (string) $response['request'];
+        }
+
+        if (!$message && !empty($response['error'])) {
+            $message = (string) $response['error'];
+        }
+
+        return $message;
+    }
+
+    private function isKwInvalid(?int $httpCode, string $message): bool
+    {
+        if ($httpCode === 401) {
+            return true;
+        }
+
+        $normalized = mb_strtolower($message);
+
+        return str_contains($normalized, 'kw inválid');
+    }
+
+    private function isNoPlanFound(?int $httpCode, string $message): bool
+    {
+        if ($httpCode === 404) {
+            return true;
+        }
+
+        $normalized = mb_strtolower($message);
+
+        return str_contains($normalized, 'plano ativo');
+    }
 }
