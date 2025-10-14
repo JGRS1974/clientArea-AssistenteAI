@@ -39,12 +39,13 @@ class TicketTool extends Tool
 
         $normalizedCpf = $this->normalizeCpf($cpf);
 
-        if (!$normalizedCpf) {
+        if (!$normalizedCpf || !$this->isValidCpf($normalizedCpf)) {
             $storedCpf = $this->getStoredCpf();
 
-            if (!$storedCpf) {
+            if (!$storedCpf || !$this->isValidCpf($storedCpf)) {
+                $this->signalTicketError('cpf_invalid');
                 $this->clearTicketData();
-                return "O CPF fornecido é inválido.";
+                return "CPF inválido.";
             }
 
             $cpf = $storedCpf;
@@ -53,18 +54,19 @@ class TicketTool extends Tool
             $this->refreshStoredCpf($cpf);
         }
 
-        if (!preg_match('/^\d{11}$/', $cpf)) {
-            $this->clearTicketData();
-            return "O CPF fornecido é inválido.";
-        }
-
         $this->clearTicketData();
 
-        $pin = $this->pinService->generatePinWithDailyCache($cpf);
+        $pinResult = $this->generatePinSafely($cpf);
+        if (!$pinResult['success']) {
+            $this->signalTicketError($pinResult['error'] ?? 'pin_invalid');
+            return $pinResult['message'] ?? "PIN inválido.";
+        }
+
+        $pin = $pinResult['pin'];
 
         //Busca informação sobre a cobrança do cliente
         $url = env('CLIENT_API_BASE_URL').'/tsmadesao/cobrancas';
-        $data = ['cpf' => $cpf, 'pin' => $pin['pin']];
+        $data = ['cpf' => $cpf, 'pin' => $pin];
 
         $responseCollection = $this->apiService->apiConsumer($data, $url);
         if ($responseCollection['success']){
@@ -79,11 +81,18 @@ class TicketTool extends Tool
                 foreach ($responseCollection['result']['cobrancas'] as $key => $cobranca) {
                     $codigocobranca = $cobranca['codigo'];
 
-                    $data = ['cpf' => $cpf, 'codigocobranca' => $codigocobranca, 'pin' => $pin['pin']];
+                    $data = ['cpf' => $cpf, 'codigocobranca' => $codigocobranca, 'pin' => $pin];
                     $responseTicket = $this->apiService->apiConsumer($data, $url);
 
                     if ($responseTicket['success']){
                         array_push($arrayTemp, $responseTicket['result']);
+                    } else {
+                        $handled = $this->handleTicketErrorResponse($responseTicket);
+                        if ($handled) {
+                            $this->signalTicketError($handled['code'], $handled['detail'] ?? null);
+                            $this->storeTicketData([]);
+                            return $handled['message'];
+                        }
                     }
                 }
                 if (!empty($arrayTemp)){
@@ -110,6 +119,14 @@ class TicketTool extends Tool
             }
         }else{
 
+            $handled = $this->handleTicketErrorResponse($responseCollection);
+            if ($handled) {
+                $this->signalTicketError($handled['code'], $handled['detail'] ?? null);
+                $this->clearTicketData();
+                return $handled['message'];
+            }
+
+            $this->signalTicketError('technical_error');
             $this->clearTicketData();
             return "Não foi possível consultar o boleto para o CPF {$cpf}, ocorreu um erro técnico.";
         }
@@ -208,5 +225,151 @@ class TicketTool extends Tool
         }
 
         Cache::put("conv:{$this->conversationId}:last_cpf", $cpf, 3600);
+    }
+
+    private function isValidCpf(string $cpf): bool
+    {
+        if (!preg_match('/^\d{11}$/', $cpf)) {
+            return false;
+        }
+
+        if (preg_match('/^(\\d)\\1{10}$/', $cpf)) {
+            return false;
+        }
+
+        for ($t = 9; $t < 11; $t++) {
+            $sum = 0;
+            for ($i = 0; $i < $t; $i++) {
+                $sum += intval($cpf[$i]) * (($t + 1) - $i);
+            }
+
+            $digit = ((10 * $sum) % 11) % 10;
+
+            if (intval($cpf[$t]) !== $digit) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function generatePinSafely(string $cpf): array
+    {
+        try {
+            $pin = $this->pinService->generatePinWithDailyCache($cpf);
+
+            if (!isset($pin['pin'])) {
+                return [
+                    'success' => false,
+                    'error' => 'pin_invalid',
+                    'message' => "PIN inválido.",
+                ];
+            }
+
+            return [
+                'success' => true,
+                'pin' => $pin['pin'],
+            ];
+        } catch (Exception $e) {
+            if (stripos($e->getMessage(), 'cpf') !== false) {
+                return [
+                    'success' => false,
+                    'error' => 'cpf_invalid',
+                    'message' => "CPF inválido.",
+                ];
+            }
+
+            return [
+                'success' => false,
+                'error' => 'pin_invalid',
+                'message' => "PIN inválido.",
+            ];
+        }
+    }
+
+    private function handleTicketErrorResponse(array $response): ?array
+    {
+        $httpCode = $response['httpcode'] ?? null;
+        $message = $this->extractErrorMessage($response);
+        $normalizedMessage = mb_strtolower($message);
+
+        if ($httpCode === 401 || str_contains($normalizedMessage, 'pin inválido')) {
+            return [
+                'code' => 'pin_invalid',
+                'message' => "PIN inválido.",
+            ];
+        }
+
+        if ($httpCode === 404 && str_contains($normalizedMessage, 'boleto indisponível')) {
+            $detail = $this->extractDetailFromMessage($message);
+            return [
+                'code' => 'boleto_indisponivel',
+                'message' => "Boleto indisponível.",
+                'detail' => $detail,
+            ];
+        }
+
+        if ($httpCode === 400 && str_contains($normalizedMessage, 'cpf inválido')) {
+            return [
+                'code' => 'cpf_invalid',
+                'message' => "CPF inválido.",
+            ];
+        }
+
+        if ($httpCode && $httpCode >= 400) {
+            return [
+                'code' => 'technical_error',
+                'message' => "Erro técnico ao consultar boletos.",
+            ];
+        }
+
+        return null;
+    }
+
+    private function extractErrorMessage(array $response): string
+    {
+        $result = $response['result'] ?? null;
+
+        if (is_array($result)) {
+            return $result['message'] ?? $result['error'] ?? json_encode($result);
+        }
+
+        if (is_string($result) && $result !== '') {
+            return $result;
+        }
+
+        if (!empty($response['request'])) {
+            return (string) $response['request'];
+        }
+
+        if (!empty($response['error'])) {
+            return (string) $response['error'];
+        }
+
+        return '';
+    }
+
+    private function extractDetailFromMessage(string $message): ?string
+    {
+        if (preg_match('/vencido há\\s+\\d+\\s+dias/i', $message, $matches)) {
+            return $matches[0];
+        }
+
+        return null;
+    }
+
+    private function signalTicketError(string $code, ?string $detail = null): void
+    {
+        if (!$this->conversationId) {
+            return;
+        }
+
+        Cache::put("conv:{$this->conversationId}:ticket_error", $code, 3600);
+
+        if ($detail) {
+            Cache::put("conv:{$this->conversationId}:ticket_error_detail", $detail, 3600);
+        } else {
+            Cache::forget("conv:{$this->conversationId}:ticket_error_detail");
+        }
     }
 }

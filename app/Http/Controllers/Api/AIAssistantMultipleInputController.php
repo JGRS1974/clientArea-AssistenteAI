@@ -164,9 +164,15 @@ class AIAssistantMultipleInputController extends Controller
         $kwStatus = Cache::get($kwStatusKey);
 
         $statusLogin = $this->resolveStatusLogin($kw, $kwStatus);
+        //Log::info('statusLogin ' . $statusLogin . ' - kw ' . $kw . ' - kw_status ' . $kwStatus);
 
         // Monta mensagens para o Prism
         $this->cardTool->setKw($kw);
+
+        $ticketErrorKey = $this->getConversationCacheKey($conversationId, 'ticket_error');
+        $ticketErrorDetailKey = $this->getConversationCacheKey($conversationId, 'ticket_error_detail');
+        $ticketError = Cache::get($ticketErrorKey);
+        $ticketErrorDetail = Cache::get($ticketErrorDetailKey);
 
         $messages = [
             new SystemMessage(view('prompts.assistant-prompt', [
@@ -175,6 +181,8 @@ class AIAssistantMultipleInputController extends Controller
                 'isFirstAssistantTurn' => $isFirstAssistantTurn,
                 'kwStatus' => $kwStatus,
                 'hasStoredCpf' => $storedCpf ? 'true' : 'false',
+                'ticketError' => $ticketError,
+                'ticketErrorDetail' => $ticketErrorDetail,
             ])->render())
         ];
 
@@ -229,20 +237,18 @@ class AIAssistantMultipleInputController extends Controller
     {
         $statusKey = $this->getConversationCacheKey($conversationId, 'kw_status');
         $hashKey = $this->getConversationCacheKey($conversationId, 'kw_hash');
+        $valueKey = $this->getConversationCacheKey($conversationId, 'kw_value');
 
         if ($kw) {
             $currentHash = hash('sha256', $kw);
-            $storedHash = Cache::get($hashKey);
-
-            if ($storedHash && $storedHash !== $currentHash) {
-                Cache::forget($statusKey);
-            }
-
             Cache::put($hashKey, $currentHash, 3600);
+            Cache::put($valueKey, $kw, 3600);
+            Cache::forget($statusKey);
             return;
         }
 
         Cache::forget($hashKey);
+        Cache::forget($valueKey);
         Cache::forget($statusKey);
     }
 
@@ -273,6 +279,8 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         Cache::forget($lastToolKey);
+        Cache::forget($this->getConversationCacheKey($conversationId, 'ticket_error'));
+        Cache::forget($this->getConversationCacheKey($conversationId, 'ticket_error_detail'));
 
         return $payload;
     }
@@ -289,7 +297,7 @@ class AIAssistantMultipleInputController extends Controller
 
     private function extractCpf(string $text): ?string
     {
-        if (preg_match('/\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/', $text, $matches)) {
+        if (preg_match('/\b\d{3}[.\s]?\d{3}[.\s]?\d{3}[-\s]?\d{2}\b/', $text, $matches)) {
             $cpf = preg_replace('/\D/', '', $matches[0]);
             return strlen($cpf) === 11 ? $cpf : null;
         }

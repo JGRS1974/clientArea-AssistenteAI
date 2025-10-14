@@ -44,7 +44,8 @@ class CardTool extends Tool
     public function __invoke(string $cpf, ?string $kw = null)
     {
         $normalizedCpf = $this->normalizeCpf($cpf);
-
+        //Log::info('kw CardTool ' . $this->kw);
+        //Log::info('cpf CardTool ' . $normalizedCpf);
         if (!$normalizedCpf) {
             $storedCpf = $this->getStoredCpf();
 
@@ -66,7 +67,7 @@ class CardTool extends Tool
             return "O CPF fornecido é inválido.";
         }
 
-        $kw = $kw ?? $this->kw;
+        $kw = $kw ?? $this->kw ?? $this->getStoredKw();
 
         if (empty($kw)) {
             Log::warning('CardTool executada sem kw.');
@@ -201,7 +202,7 @@ class CardTool extends Tool
     {
         $statusKey = $this->getCacheKey('kw_status');
         $hashKey = $this->getCacheKey('kw_hash');
-
+        //Log::info('kw_hash CardTool ' . $hashKey);
         if (!$statusKey || !$hashKey) {
             return;
         }
@@ -264,6 +265,22 @@ class CardTool extends Tool
         $normalized = mb_strtolower($message);
 
         return str_contains($normalized, 'plano ativo');
+    }
+
+    private function getStoredKw(): ?string
+    {
+        if (!$this->conversationId) {
+            return null;
+        }
+
+        $cacheKey = $this->getCacheKey('kw_value');
+        $kw = Cache::get($cacheKey);
+
+        if ($kw) {
+            Cache::put($cacheKey, $kw, 3600);
+        }
+
+        return $kw ?: null;
     }
 
     private function normalizeCpf(?string $cpf): ?string
