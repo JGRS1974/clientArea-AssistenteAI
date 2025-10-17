@@ -64,7 +64,7 @@ class AIAssistantMultipleInputController extends Controller
 
         $conversationId = $this->conversationIdService->setConversationId($request);
         $kw = $request->header('kw', null);
-
+        //Log::info('kw ' . $kw);
         $this->syncKwStatusWithHeader($conversationId, $kw);
         $this->ticketTool->setConversationId($conversationId);
         $this->cardTool->setConversationId($conversationId);
@@ -84,6 +84,11 @@ class AIAssistantMultipleInputController extends Controller
             $detectedCpf = $this->extractCpf($userInput);
             if ($detectedCpf) {
                 $this->storeLastCpf($conversationId, $detectedCpf);
+            }
+
+            $detectedIntent = $this->detectIntentFromMessage($userInput);
+            if ($detectedIntent) {
+                $this->storeIntent($conversationId, $detectedIntent);
             }
 
             // Adiciona mensagem do usuário à conversa
@@ -185,7 +190,7 @@ class AIAssistantMultipleInputController extends Controller
                 'ticketErrorDetail' => $ticketErrorDetail,
             ])->render())
         ];
-
+        //Log::info('PROMPT' , $messages);
         foreach ($conversationMessages as $message) {
             if ($message['role'] === 'user') {
                 $messages[] = new UserMessage($message['content']);
@@ -262,6 +267,7 @@ class AIAssistantMultipleInputController extends Controller
         $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
         $lastTool = Cache::get($lastToolKey);
         $shouldShowLogin = $this->shouldShowLoginButton($conversationId);
+        $intent = $this->getStoredIntent($conversationId);
 
         if ($lastTool === 'ticket') {
             $ticketsKey = $this->getConversationCacheKey($conversationId, 'boletos');
@@ -280,8 +286,8 @@ class AIAssistantMultipleInputController extends Controller
             }
             Cache::forget($beneficiariesKey);
         } else {
-            if ($shouldShowLogin) {
-                $payload['login'] = true;
+            if ($intent === 'card') {
+                $payload['login'] = $shouldShowLogin;
             }
         }
 
@@ -298,6 +304,49 @@ class AIAssistantMultipleInputController extends Controller
         $kwStatus = Cache::get($this->getConversationCacheKey($conversationId, 'kw_status'));
 
         return $this->resolveStatusLogin($kw, $kwStatus) !== 'usuário logado';
+    }
+
+    private function detectIntentFromMessage(string $message): ?string
+    {
+        $normalized = mb_strtolower($message, 'UTF-8');
+
+        if (preg_match('/\b(boleto|segunda via|2a via|fatura|pagamento)\b/u', $normalized)) {
+            return 'ticket';
+        }
+
+        if (preg_match('/carteir|cart[ãa]o virtual|documento digital/u', $normalized)) {
+            return 'card';
+        }
+
+        return null;
+    }
+
+    private function storeIntent(string $conversationId, string $intent): void
+    {
+        $cacheKey = $this->getConversationCacheKey($conversationId, 'intent');
+        Cache::put($cacheKey, $intent, 3600);
+
+        $this->redisConversationService->setMetadataField($conversationId, 'intent', $intent);
+        $this->redisConversationService->setMetadataField($conversationId, 'intent_at', now()->toISOString());
+    }
+
+    private function getStoredIntent(string $conversationId): ?string
+    {
+        $cacheKey = $this->getConversationCacheKey($conversationId, 'intent');
+        $intent = Cache::get($cacheKey);
+
+        if ($intent) {
+            Cache::put($cacheKey, $intent, 3600);
+            return $intent;
+        }
+
+        $metaIntent = $this->redisConversationService->getMetadataField($conversationId, 'intent');
+        if ($metaIntent) {
+            Cache::put($cacheKey, $metaIntent, 3600);
+            return $metaIntent;
+        }
+
+        return null;
     }
 
     private function resetConversationToolState(string $conversationId): void
