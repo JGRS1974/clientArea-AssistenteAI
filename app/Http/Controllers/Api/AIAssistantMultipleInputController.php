@@ -261,6 +261,7 @@ class AIAssistantMultipleInputController extends Controller
 
         $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
         $lastTool = Cache::get($lastToolKey);
+        $shouldShowLogin = $this->shouldShowLoginButton($conversationId);
 
         if ($lastTool === 'ticket') {
             $ticketsKey = $this->getConversationCacheKey($conversationId, 'boletos');
@@ -270,12 +271,18 @@ class AIAssistantMultipleInputController extends Controller
             }
             Cache::forget($ticketsKey);
         } elseif ($lastTool === 'card') {
+            $payload['login'] = $shouldShowLogin;
+
             $beneficiariesKey = $this->getConversationCacheKey($conversationId, 'beneficiarios');
             $beneficiaries = Cache::get($beneficiariesKey);
             if (is_array($beneficiaries)) {
                 $payload['beneficiarios'] = $beneficiaries;
             }
             Cache::forget($beneficiariesKey);
+        } else {
+            if ($shouldShowLogin) {
+                $payload['login'] = true;
+            }
         }
 
         Cache::forget($lastToolKey);
@@ -283,6 +290,14 @@ class AIAssistantMultipleInputController extends Controller
         Cache::forget($this->getConversationCacheKey($conversationId, 'ticket_error_detail'));
 
         return $payload;
+    }
+
+    private function shouldShowLoginButton(string $conversationId): bool
+    {
+        $kw = Cache::get($this->getConversationCacheKey($conversationId, 'kw_value'));
+        $kwStatus = Cache::get($this->getConversationCacheKey($conversationId, 'kw_status'));
+
+        return $this->resolveStatusLogin($kw, $kwStatus) !== 'usuário logado';
     }
 
     private function resetConversationToolState(string $conversationId): void
