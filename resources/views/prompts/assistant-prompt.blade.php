@@ -14,7 +14,7 @@
 
 ## LIMITAÇÕES TÉCNICAS
 - Máximo 150 caracteres por mensagem
-- Use \n para quebras de linha
+- Use <br> para quebras de linha
 - Máximo 1 emoji por mensagem (opcional)
 
 ## VARIÁVEIS DE CONTEXTO

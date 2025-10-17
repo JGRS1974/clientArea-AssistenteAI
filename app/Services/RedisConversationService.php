@@ -9,7 +9,7 @@ class RedisConversationService
 {
     //private const CONVERSATION_TTL = 3600; // 1 hour
     //private const CONTEXT_TTL = 1800; // 30 minutes
-    private const MAX_MESSAGES = 50;
+    private const MAX_MESSAGES = 10;
 
     public function __construct(private $conversationRedis = null) {
         $this->conversationRedis = Redis::connection('conversations');
