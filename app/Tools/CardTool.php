@@ -19,7 +19,7 @@ class CardTool extends Tool
     public function __construct(ApiConsumerService $apiService, PinGeneratorService $pinService )
     {
         $this->as('card_lookup')
-            ->for('Recupera informação da carterinha do cliente pelo CPF informado e após o cliente fazer login no sistema para obter a chave de acesso.')
+            ->for('Recupera dados do cliente (carteirinha, planos, ficha financeira e coparticipação) após login confirmado e com CPF válido.')
             ->withStringParameter('cpf', 'CPF do cliente')
             ->using($this);
 
@@ -43,22 +43,18 @@ class CardTool extends Tool
 
     public function __invoke(string $cpf, ?string $kw = null)
     {
+        $storedCpf = $this->getStoredCpf();
         $normalizedCpf = $this->normalizeCpf($cpf);
-        //Log::info('kw CardTool ' . $this->kw);
-        //Log::info('cpf CardTool ' . $normalizedCpf);
-        if (!$normalizedCpf) {
-            $storedCpf = $this->getStoredCpf();
 
-            if (!$storedCpf) {
-                $this->clearCardData();
-                $this->setKwStatus(null);
-                return "O CPF fornecido é inválido.";
-            }
-
+        if ($storedCpf) {
             $cpf = $storedCpf;
-        } else {
+        } elseif ($normalizedCpf) {
             $cpf = $normalizedCpf;
             $this->refreshStoredCpf($cpf);
+        } else {
+            $this->clearCardData();
+            $this->setKwStatus(null);
+            return "O CPF fornecido é inválido.";
         }
 
         if (!preg_match('/^\d{11}$/', $cpf)) {
@@ -85,17 +81,32 @@ class CardTool extends Tool
 
         if ($responseDataClient['success']) {
             $this->setKwStatus('valid', $kw);
-            if (($responseDataClient['result']['quantidade'] ?? 0) !== 0) {
-                $beneficiariesInformation = $this->formatBeneficiaries($responseDataClient['result']['planos'] ?? []);
+            $planos = $responseDataClient['result']['planos'] ?? [];
 
-                $this->storeCardData($beneficiariesInformation);
+            if (($responseDataClient['result']['quantidade'] ?? 0) !== 0 && !empty($planos)) {
+                $beneficiariesInformation = $this->formatBeneficiaries($planos);
+                $contractsInformation = $this->formatContracts($planos);
+                $financialInformation = $this->formatFinancialReport($planos);
+                $coparticipationInformation = $this->formatCoparticipation($planos);
 
-                if (!empty($beneficiariesInformation)) {
+                $this->storeCardDataExtended(
+                    $beneficiariesInformation,
+                    $contractsInformation,
+                    $financialInformation,
+                    $coparticipationInformation
+                );
+
+                if (
+                    !empty($beneficiariesInformation) ||
+                    !empty($contractsInformation) ||
+                    !empty($financialInformation) ||
+                    !empty($coparticipationInformation)
+                ) {
                     return "Carteirinha encontrada. Lista pronta para exibição.";
                 }
             }
 
-            $this->storeCardData([]);
+            $this->storeCardDataExtended([], [], [], []);
             return "Nenhuma informação da carterinha foi encontrada para o CPF do cliente {$cpf}.";
         }
 
@@ -110,7 +121,7 @@ class CardTool extends Tool
 
         if ($this->isNoPlanFound($httpCode, $errorMessage)) {
             $this->setKwStatus('valid', $kw);
-            $this->storeCardData([]);
+            $this->storeCardDataExtended([], [], [], []);
             return "Nenhuma informação da carterinha foi encontrada para o CPF do cliente {$cpf}.";
         }
 
@@ -143,8 +154,55 @@ class CardTool extends Tool
                 ];
             }
         }
-
+        Log::info('Beneficiarios', $beneficiariesInformation);
         return $beneficiariesInformation;
+    }
+
+    private function formatContracts(array $planos): array
+    {
+        $contracts = [];
+
+        foreach ($planos as $plano) {
+            $contract = $plano['contrato'] ?? null;
+
+            if (is_array($contract) && !empty($contract)) {
+                $contracts[] = $contract;
+            }
+        }
+        Log::info('planos', $contracts);
+        return $contracts;
+    }
+
+    private function formatFinancialReport(array $planos): array
+    {
+        $report = [];
+
+        foreach ($planos as $plano) {
+            $financial = $plano['fichafinanceira'] ?? [];
+            $report[] = [
+                'plano' => $plano['contrato']['plano'] ?? '',
+                //'contrato' => $plano['contrato'] ?? [],
+                'fichafinanceira' => is_array($financial) ? array_values($financial) : [],
+            ];
+        }
+        Log::info('financeiro', $report);
+        return $report;
+    }
+
+    private function formatCoparticipation(array $planos): array
+    {
+        $coparticipation = [];
+
+        foreach ($planos as $plano) {
+            $copart = $plano['coparticipacao'] ?? [];
+            $coparticipation[] = [
+                'plano' => $plano['contrato']['plano'] ?? '',
+                //'contrato' => $plano['contrato'] ?? [],
+                'coparticipacao' => is_array($copart) ? array_values($copart) : [],
+            ];
+        }
+        Log::info('coparticipacao', $coparticipation);
+        return $coparticipation;
     }
 
     private function formatBirthDate(?string $date): string
@@ -162,30 +220,35 @@ class CardTool extends Tool
         return date('Y-m-d', $timestamp);
     }
 
-    private function storeCardData(array $beneficiaries): void
+    private function storeCardDataExtended(array $beneficiaries, array $contracts, array $financial, array $coparticipation): void
     {
-        $dataKey = $this->getCacheKey('beneficiarios');
-        $lastToolKey = $this->getCacheKey('last_tool');
+        $map = [
+            'beneficiarios' => $beneficiaries,
+            'planos' => $contracts,
+            'fichafinanceira' => $financial,
+            'coparticipacao' => $coparticipation,
+        ];
 
-        if (!$dataKey || !$lastToolKey) {
-            return;
+        foreach ($map as $suffix => $value) {
+            $key = $this->getCacheKey($suffix);
+            if ($key) {
+                Cache::put($key, $value, 3600);
+            }
         }
 
-        Cache::put($dataKey, $beneficiaries, 3600);
-        Cache::put($lastToolKey, 'card', 3600);
+        $lastToolKey = $this->getCacheKey('last_tool');
+        if ($lastToolKey) {
+            Cache::put($lastToolKey, 'card', 3600);
+        }
     }
 
     private function clearCardData(): void
     {
-        $dataKey = $this->getCacheKey('beneficiarios');
-        $lastToolKey = $this->getCacheKey('last_tool');
-
-        if ($dataKey) {
-            Cache::forget($dataKey);
-        }
-
-        if ($lastToolKey) {
-            Cache::forget($lastToolKey);
+        foreach (['beneficiarios', 'planos', 'fichafinanceira', 'coparticipacao', 'last_tool'] as $suffix) {
+            $key = $this->getCacheKey($suffix);
+            if ($key) {
+                Cache::forget($key);
+            }
         }
     }
 
@@ -202,7 +265,7 @@ class CardTool extends Tool
     {
         $statusKey = $this->getCacheKey('kw_status');
         $hashKey = $this->getCacheKey('kw_hash');
-        //Log::info('kw_hash CardTool ' . $hashKey);
+        Log::info('kw_hash CardTool ' . $hashKey);
         if (!$statusKey || !$hashKey) {
             return;
         }

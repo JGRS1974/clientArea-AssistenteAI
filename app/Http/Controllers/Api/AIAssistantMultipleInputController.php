@@ -10,6 +10,7 @@ use Illuminate\Http\Request;
 use Prism\Prism\Enums\Provider;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Str;
 use App\Http\Controllers\Controller;
 use App\Services\ConversationIdService;
 use App\Services\ConversationService;
@@ -63,8 +64,8 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         $conversationId = $this->conversationIdService->setConversationId($request);
-        $kw = $request->header('kw', null);
-        //Log::info('kw ' . $kw);
+        $kw = $request->kw;
+        Log::info('kw enviado payload ' . $kw);
         $this->syncKwStatusWithHeader($conversationId, $kw);
         $this->ticketTool->setConversationId($conversationId);
         $this->cardTool->setConversationId($conversationId);
@@ -90,6 +91,9 @@ class AIAssistantMultipleInputController extends Controller
             if ($detectedIntent) {
                 $this->storeIntent($conversationId, $detectedIntent);
             }
+
+            $payloadRequest = $this->detectPayloadRequestFromMessage($userInput);
+            $this->storePayloadRequest($conversationId, $payloadRequest);
 
             // Adiciona mensagem do usuário à conversa
             //$this->conversationService->addMessage($conversationId, 'user', $userInput);
@@ -174,6 +178,10 @@ class AIAssistantMultipleInputController extends Controller
         // Monta mensagens para o Prism
         $this->cardTool->setKw($kw);
 
+        $payloadRequest = $this->getStoredPayloadRequest($conversationId);
+        $requestedFields = $payloadRequest['fields'] ?? [];
+        $primaryCardField = $this->determinePrimaryCardField($requestedFields);
+
         $ticketErrorKey = $this->getConversationCacheKey($conversationId, 'ticket_error');
         $ticketErrorDetailKey = $this->getConversationCacheKey($conversationId, 'ticket_error_detail');
         $ticketError = Cache::get($ticketErrorKey);
@@ -186,6 +194,8 @@ class AIAssistantMultipleInputController extends Controller
                 'isFirstAssistantTurn' => $isFirstAssistantTurn,
                 'kwStatus' => $kwStatus,
                 'hasStoredCpf' => $storedCpf ? 'true' : 'false',
+                'cardRequestedFields' => $requestedFields,
+                'primaryCardField' => $primaryCardField,
                 'ticketError' => $ticketError,
                 'ticketErrorDetail' => $ticketErrorDetail,
             ])->render())
@@ -200,14 +210,18 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         try{
+            $tools = [];
+
+            if ($storedCpf) {
+                $tools[] = $this->ticketTool;
+                $tools[] = $this->cardTool;
+            }
+
             $response = Prism::text()
                 ->using(Provider::OpenAI, 'gpt-4.1')
                 ->withMessages($messages)
                 ->withMaxSteps(3)
-                ->withTools([
-                    $this->ticketTool,
-                    $this->cardTool
-                ])
+                ->withTools($tools)
                 ->withProviderOptions([
                     'temperature' => 0.85,
                     'top_p' => 0.9,
@@ -246,9 +260,33 @@ class AIAssistantMultipleInputController extends Controller
 
         if ($kw) {
             $currentHash = hash('sha256', $kw);
+            $storedHash = Cache::get($hashKey);
+
             Cache::put($hashKey, $currentHash, 3600);
             Cache::put($valueKey, $kw, 3600);
-            Cache::forget($statusKey);
+
+            if ($storedHash !== $currentHash) {
+                Cache::forget($statusKey);
+            } else {
+                Cache::put($statusKey, Cache::get($statusKey), 3600);
+            }
+
+            return;
+        }
+
+        $storedValue = Cache::get($valueKey);
+        $storedHash = Cache::get($hashKey);
+
+        if ($storedValue) {
+            Cache::put($valueKey, $storedValue, 3600);
+        }
+
+        if ($storedHash) {
+            Cache::put($hashKey, $storedHash, 3600);
+        }
+
+        if ($storedValue || $storedHash) {
+            Cache::put($statusKey, Cache::get($statusKey), 3600);
             return;
         }
 
@@ -279,12 +317,48 @@ class AIAssistantMultipleInputController extends Controller
         } elseif ($lastTool === 'card') {
             $payload['login'] = $shouldShowLogin;
 
-            $beneficiariesKey = $this->getConversationCacheKey($conversationId, 'beneficiarios');
-            $beneficiaries = Cache::get($beneficiariesKey);
-            if (is_array($beneficiaries)) {
-                $payload['beneficiarios'] = $beneficiaries;
+            $payloadRequest = $this->getStoredPayloadRequest($conversationId);
+            $requestedFields = $payloadRequest['fields'] ?? [];
+            $contractFilters = $payloadRequest['contract_filters'] ?? [];
+            $periodFilters = $payloadRequest['period_filters'] ?? [];
+
+            $requestedFields = array_values(array_unique(array_filter($requestedFields)));
+
+            $dataMap = [
+                'beneficiarios' => 'beneficiarios',
+                'planos' => 'planos',
+                'fichafinanceira' => 'fichafinanceira',
+                'coparticipacao' => 'coparticipacao',
+            ];
+
+            foreach ($dataMap as $field => $suffix) {
+                $cacheKey = $this->getConversationCacheKey($conversationId, $suffix);
+                $rawData = $cacheKey ? Cache::get($cacheKey) : null;
+
+                if ($cacheKey) {
+                    Cache::forget($cacheKey);
+                }
+
+                if (!in_array($field, $requestedFields, true)) {
+                    continue;
+                }
+
+                $data = is_array($rawData) ? $rawData : [];
+
+                if (in_array($field, ['planos', 'fichafinanceira', 'coparticipacao'], true)) {
+                    $data = $this->filterCardDataByContractFilters($data, $contractFilters, $field);
+                }
+
+                if (in_array($field, ['fichafinanceira', 'coparticipacao'], true)) {
+                    $data = $this->filterCardDataByPeriod($data, $periodFilters, $field);
+                }
+
+                $data = array_values($data);
+
+                $payload[$field] = $data;
             }
-            Cache::forget($beneficiariesKey);
+
+            $this->clearStoredPayloadRequest($conversationId);
         } else {
             if ($intent === 'card') {
                 $payload['login'] = $shouldShowLogin;
@@ -314,11 +388,578 @@ class AIAssistantMultipleInputController extends Controller
             return 'ticket';
         }
 
-        if (preg_match('/carteir|cart[ãa]o virtual|documento digital/u', $normalized)) {
+        $isCardIntent =
+            preg_match('/carteir|cart[ãa]o virtual|documento digital/u', $normalized) ||
+            preg_match('/\b(planos?|contratos?)\b/u', $normalized) ||
+            preg_match('/relat[óo]rio\s*financeir[oa]|ficha\s*financeir[oa]|(?:meu|minha|seu|sua|o|a)?\s*financeir[oa]\b|\bfinanceir[oa]\b/u', $normalized) ||
+            preg_match('/co[-\s]?participa[cç][aã]o/u', $normalized);
+
+        if ($isCardIntent) {
             return 'card';
         }
 
         return null;
+    }
+
+    private function detectPayloadRequestFromMessage(string $message): array
+    {
+        $normalized = mb_strtolower($message, 'UTF-8');
+        $fields = [];
+
+        $hasCardRequest = (bool) preg_match('/carteir|cart[ãa]o virtual|documento digital/u', $normalized);
+        $hasFinanceRequest = (bool) preg_match('/relat[óo]rio\s*financeir[oa]|ficha\s*financeir[oa]|(?:meu|minha|seu|sua|o|a)\s*financeir[oa]|\bfinanceir[oa]\b/u', $normalized);
+        $hasCoparticipationRequest = (bool) preg_match('/co[-\s]?participa[cç][aã]o|coparticipa[cç][aã]o|\bcopart\b/u', $normalized);
+
+        if ($hasCardRequest) {
+            $fields[] = 'beneficiarios';
+        }
+
+        if ($hasFinanceRequest) {
+            $fields[] = 'fichafinanceira';
+        }
+
+        if ($hasCoparticipationRequest) {
+            $fields[] = 'coparticipacao';
+        }
+
+        $mentionsPlansPlural = (bool) preg_match('/\bplanos\b/u', $normalized);
+        $mentionsContractsPlural = (bool) preg_match('/\bcontratos\b/u', $normalized);
+        $explicitPlansRequest = (bool) preg_match('/\b(meus?|suas?|seus?|quais|qual|mostrar|mostre|retorne|retorna|retornar|lista|listar|ver|veja|exibir|exiba|consultar|consulte)\s+(?:os\s+|as\s+)?(planos|contratos)\b/u', $normalized);
+
+        if ($explicitPlansRequest || $mentionsPlansPlural || $mentionsContractsPlural) {
+            $fields[] = 'planos';
+        }
+
+        $contractFilters = $this->extractContractFilters($message);
+        $periodFilters = $this->extractPeriodFilters($message);
+
+        return [
+            'fields' => array_values(array_unique($fields)),
+            'contract_filters' => $contractFilters,
+            'period_filters' => $periodFilters,
+        ];
+    }
+
+    private function extractContractFilters(string $message): array
+    {
+        $filters = [
+            'plan' => [],
+            'entidade' => [],
+            'operadora' => [],
+            'fantasia' => [],
+            'id' => [],
+            'numerocontrato' => [],
+        ];
+
+        $filters['plan'] = $this->extractTermsByKeywords($message, ['plano', 'planos']);
+        $filters['entidade'] = $this->extractTermsByKeywords($message, ['entidade', 'entidades']);
+        $filters['operadora'] = $this->extractTermsByKeywords($message, ['operadora', 'operadoras']);
+        $filters['fantasia'] = $this->extractTermsByKeywords($message, ['fantasia', 'nome fantasia', 'operadora fantasia']);
+
+        $filters['id'] = $this->extractContractIdTerms($message);
+        $filters['numerocontrato'] = $this->extractNumeroContratoTerms($message);
+
+        foreach ($filters as $key => $list) {
+            $normalized = [];
+            foreach ($list as $value) {
+                $norm = $this->normalizeText($value);
+                if ($norm !== '') {
+                    $normalized[$norm] = $norm;
+                }
+            }
+            $filters[$key] = array_values(array_unique(array_values($normalized)));
+        }
+
+        return $filters;
+    }
+
+    private function extractTermsByKeywords(string $message, array $keywords): array
+    {
+        $terms = [];
+
+        foreach ($keywords as $keyword) {
+            $patternKeyword = preg_quote($keyword, '/');
+            $pattern = '/\b' . $patternKeyword . '\b(?:\s+(?:do|da|de|dos|das|para|pra|no|na|nos|nas|sobre|dois))*\s+([^.;:!\n]+)/iu';
+
+            if (preg_match_all($pattern, $message, $matches)) {
+                foreach ($matches[1] as $segment) {
+                    foreach ($this->splitSegmentIntoTerms($segment) as $term) {
+                        $terms[] = $term;
+                    }
+                }
+            }
+        }
+
+        return $terms;
+    }
+
+    private function splitSegmentIntoTerms(string $segment): array
+    {
+        $segment = trim($segment);
+
+        if ($segment === '') {
+            return [];
+        }
+
+        $segment = str_replace(['/', ';', '|'], ',', $segment);
+        $segment = preg_replace('/\s+(e|ou)\s+/iu', ',', $segment);
+
+        $parts = array_map('trim', explode(',', $segment));
+        $result = [];
+
+        foreach ($parts as $part) {
+            if ($part === '') {
+                continue;
+            }
+
+            $part = preg_replace('/^(do|da|de|dos|das|meu|minha|seu|sua|o|a)\s+/iu', '', $part);
+            $part = trim($part);
+
+            if ($part !== '') {
+                $result[] = $part;
+            }
+        }
+
+        return $result;
+    }
+
+    private function extractContractIdTerms(string $message): array
+    {
+        $ids = [];
+
+        if (preg_match_all('/\b\d{2,}_\d{2,}_\d{5,}\b/u', $message, $matches)) {
+            $ids = array_merge($ids, $matches[0]);
+        }
+
+        $pattern = '/\bid(?:\s+do|\s+da|\s+de|\s+do\s+contrato)?\s+([A-Za-z0-9_\-\.]+)/iu';
+        if (preg_match_all($pattern, $message, $matches)) {
+            $ids = array_merge($ids, $matches[1]);
+        }
+
+        return $ids;
+    }
+
+    private function extractNumeroContratoTerms(string $message): array
+    {
+        $numbers = [];
+
+        $patterns = [
+            '/n[úu]mero\s+do\s+contrato\s+(\d+)/iu',
+            '/contrato\s+n[ºo]?\s*\.?\s*(\d+)/iu',
+            '/contrato\s+(\d{4,})/iu',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match_all($pattern, $message, $matches)) {
+                $numbers = array_merge($numbers, $matches[1]);
+            }
+        }
+
+        return $numbers;
+    }
+
+    private function extractPeriodFilters(string $message): array
+    {
+        $normalized = $this->normalizeText($message);
+
+        $references = [];
+        $months = [];
+        $years = [];
+
+        if (preg_match_all('/\b(0?[1-9]|1[0-2])[\/\-](\d{4})\b/', $normalized, $dateMatches, PREG_SET_ORDER)) {
+            foreach ($dateMatches as $match) {
+                $month = str_pad($match[1], 2, '0', STR_PAD_LEFT);
+                $year = $match[2];
+                $references[] = "{$month}/{$year}";
+            }
+        }
+
+        $monthsMap = [
+            'janeiro' => '01',
+            'fevereiro' => '02',
+            'marco' => '03',
+            'abril' => '04',
+            'maio' => '05',
+            'junho' => '06',
+            'julho' => '07',
+            'agosto' => '08',
+            'setembro' => '09',
+            'outubro' => '10',
+            'novembro' => '11',
+            'dezembro' => '12',
+        ];
+
+        $monthsPattern = '/\b(' . implode('|', array_keys($monthsMap)) . ')\b(?:\s+de)?\s*(\d{4})?/u';
+        if (preg_match_all($monthsPattern, $normalized, $monthMatches, PREG_SET_ORDER)) {
+            foreach ($monthMatches as $match) {
+                $monthKey = $match[1];
+                $year = $match[2] ?? null;
+                $monthNumber = $monthsMap[$monthKey] ?? null;
+
+                if (!$monthNumber) {
+                    continue;
+                }
+
+                if ($year) {
+                    $references[] = "{$monthNumber}/{$year}";
+                } else {
+                    $months[] = $monthNumber;
+                }
+            }
+        }
+
+        if (preg_match_all('/\b(?:de|do|da|para|pra|em|entre|ate|até|ano|anos)\s+(20\d{2})\b/', $normalized, $yearMatches, PREG_SET_ORDER)) {
+            foreach ($yearMatches as $match) {
+                $years[] = $match[1];
+            }
+        }
+
+        return [
+            'references' => array_values(array_unique($references)),
+            'months' => array_values(array_unique($months)),
+            'years' => array_values(array_unique($years)),
+        ];
+    }
+
+    private function determinePrimaryCardField(array $fields): string
+    {
+        $fields = array_values(array_filter($fields, static function ($field) {
+            return is_string($field) && $field !== '';
+        }));
+
+        return $fields[0] ?? '';
+    }
+
+    private function normalizeContractFilters($filters): array
+    {
+        $template = [
+            'plan' => [],
+            'entidade' => [],
+            'operadora' => [],
+            'fantasia' => [],
+            'id' => [],
+            'numerocontrato' => [],
+        ];
+
+        if (!is_array($filters)) {
+            return $template;
+        }
+
+        foreach ($template as $key => $default) {
+            $values = $filters[$key] ?? [];
+            if (!is_array($values)) {
+                $values = [];
+            }
+            $normalized = [];
+            foreach ($values as $value) {
+                $norm = $this->normalizeText($value);
+                if ($norm !== '') {
+                    $normalized[$norm] = $norm;
+                }
+            }
+            $template[$key] = array_values($normalized);
+        }
+
+        return $template;
+    }
+
+    private function storePayloadRequest(string $conversationId, array $payloadRequest): void
+    {
+        $fields = $payloadRequest['fields'] ?? [];
+
+        if (empty($fields)) {
+            return;
+        }
+
+        $contractFilters = $this->normalizeContractFilters($payloadRequest['contract_filters'] ?? []);
+        $periodFilters = $payloadRequest['period_filters'] ?? [
+            'references' => [],
+            'months' => [],
+            'years' => [],
+        ];
+
+        $periodFilters = [
+            'references' => array_values(array_unique($periodFilters['references'] ?? [])),
+            'months' => array_values(array_unique($periodFilters['months'] ?? [])),
+            'years' => array_values(array_unique($periodFilters['years'] ?? [])),
+        ];
+
+        $payload = [
+            'fields' => array_values(array_unique($fields)),
+            'contract_filters' => $contractFilters,
+            'period_filters' => $periodFilters,
+        ];
+
+        $cacheKey = $this->getConversationCacheKey($conversationId, 'card_payload_request');
+        Cache::put($cacheKey, $payload, 3600);
+    }
+
+    private function getStoredPayloadRequest(string $conversationId): array
+    {
+        $cacheKey = $this->getConversationCacheKey($conversationId, 'card_payload_request');
+        $request = $cacheKey ? Cache::get($cacheKey) : null;
+
+        if (is_array($request)) {
+            $request['fields'] = array_values(array_unique($request['fields'] ?? []));
+            $request['contract_filters'] = $this->normalizeContractFilters($request['contract_filters'] ?? []);
+            $periodFilters = $request['period_filters'] ?? ['references' => [], 'months' => [], 'years' => []];
+            $request['period_filters'] = [
+                'references' => array_values(array_unique($periodFilters['references'] ?? [])),
+                'months' => array_values(array_unique($periodFilters['months'] ?? [])),
+                'years' => array_values(array_unique($periodFilters['years'] ?? [])),
+            ];
+
+            Cache::put($cacheKey, $request, 3600);
+            return $request;
+        }
+
+        return [];
+    }
+
+    private function clearStoredPayloadRequest(string $conversationId): void
+    {
+        $cacheKey = $this->getConversationCacheKey($conversationId, 'card_payload_request');
+
+        if ($cacheKey) {
+            Cache::forget($cacheKey);
+        }
+    }
+
+    private function filterCardDataByContractFilters(array $items, array $filters, string $field): array
+    {
+        $filters = $this->normalizeContractFilters($filters);
+
+        $hasFilters = false;
+        foreach ($filters as $list) {
+            if (!empty($list)) {
+                $hasFilters = true;
+                break;
+            }
+        }
+
+        if (!$hasFilters) {
+            return $items;
+        }
+
+        $filtered = [];
+
+        foreach ($items as $item) {
+            [$contract, $planName] = $this->resolveContractForItem($item, $field);
+
+            if ($this->matchesContractFilters($contract, $planName, $filters)) {
+                $filtered[] = $item;
+            }
+        }
+
+        return array_values($filtered);
+    }
+
+    private function filterCardDataByPeriod(array $items, array $periodFilters, string $field): array
+    {
+        $references = $periodFilters['references'] ?? [];
+        $months = $periodFilters['months'] ?? [];
+        $years = $periodFilters['years'] ?? [];
+
+        if (empty($references) && empty($months) && empty($years)) {
+            return $items;
+        }
+
+        $result = [];
+
+        foreach ($items as $item) {
+            if ($field === 'fichafinanceira') {
+                $entries = $item['fichafinanceira'] ?? [];
+                $filteredEntries = [];
+
+                foreach ($entries as $entry) {
+                    if ($this->matchesPeriodFilter($entry, $references, $months, $years)) {
+                        $filteredEntries[] = $entry;
+                    }
+                }
+
+                $item['fichafinanceira'] = array_values($filteredEntries);
+                $result[] = $item;
+            } elseif ($field === 'coparticipacao') {
+                $entries = $item['coparticipacao'] ?? [];
+                $filteredEntries = [];
+
+                foreach ($entries as $entry) {
+                    if ($this->matchesPeriodFilter($entry, $references, $months, $years)) {
+                        $filteredEntries[] = $entry;
+                    }
+                }
+
+                $item['coparticipacao'] = array_values($filteredEntries);
+                $result[] = $item;
+            } else {
+                $result[] = $item;
+            }
+        }
+
+        return array_values($result);
+    }
+
+    private function resolveContractForItem(array $item, string $field): array
+    {
+        if ($field === 'planos') {
+            $planName = $item['plano'] ?? ($item['contrato']['plano'] ?? null);
+            $contract = $item;
+            return [$contract, $planName];
+        }
+
+        $contract = $item['contrato'] ?? null;
+        $planName = $item['plano'] ?? ($contract['plano'] ?? null);
+
+        return [$contract, $planName];
+    }
+
+    private function matchesContractFilters(?array $contract, ?string $planName, array $filters): bool
+    {
+        $normalizedPlan = $this->normalizeText($planName ?? ($contract['plano'] ?? ''));
+        $normalizedEntidade = $this->normalizeText($contract['entidade'] ?? '');
+        $normalizedOperadora = $this->normalizeText($contract['operadora'] ?? '');
+        $normalizedFantasia = $this->normalizeText($contract['operadorafantasia'] ?? '');
+        $normalizedId = $this->normalizeText($contract['id'] ?? '');
+        $normalizedNumeroContrato = $this->normalizeText(
+            isset($contract['numerocontrato']) ? (string) $contract['numerocontrato'] : ''
+        );
+
+        $hasAnyFilter = false;
+
+        foreach ($filters as $type => $values) {
+            foreach ($values as $value) {
+                if ($value === '') {
+                    continue;
+                }
+                $hasAnyFilter = true;
+
+                switch ($type) {
+                    case 'plan':
+                        if ($normalizedPlan !== '' && str_contains($normalizedPlan, $value)) {
+                            return true;
+                        }
+                        break;
+                    case 'entidade':
+                        if ($normalizedEntidade !== '' && str_contains($normalizedEntidade, $value)) {
+                            return true;
+                        }
+                        break;
+                    case 'operadora':
+                        if (
+                            ($normalizedOperadora !== '' && str_contains($normalizedOperadora, $value)) ||
+                            ($normalizedFantasia !== '' && str_contains($normalizedFantasia, $value))
+                        ) {
+                            return true;
+                        }
+                        break;
+                    case 'fantasia':
+                        if ($normalizedFantasia !== '' && str_contains($normalizedFantasia, $value)) {
+                            return true;
+                        }
+                        break;
+                    case 'id':
+                        if ($normalizedId !== '' && str_contains($normalizedId, $value)) {
+                            return true;
+                        }
+                        break;
+                    case 'numerocontrato':
+                        if ($normalizedNumeroContrato !== '' && str_contains($normalizedNumeroContrato, $value)) {
+                            return true;
+                        }
+                        break;
+                }
+            }
+        }
+
+        return !$hasAnyFilter;
+    }
+
+    private function matchesPeriodFilter(array $entry, array $references, array $months, array $years): bool
+    {
+        $reference = $entry['referencia'] ?? null;
+        $month = null;
+        $year = null;
+        $fullReference = null;
+
+        if ($reference && preg_match('/(0[1-9]|1[0-2])\/(\d{4})/', $reference, $match)) {
+            $month = $match[1];
+            $year = $match[2];
+            $fullReference = "{$month}/{$year}";
+        }
+
+        if ((!$month || !$year) && isset($entry['datavencimento'])) {
+            [$month, $year] = $this->extractMonthYearFromDate($entry['datavencimento']);
+            if ($month && $year) {
+                $fullReference = "{$month}/{$year}";
+            }
+        }
+
+        if ((!$month || !$year) && isset($entry['datapagamento'])) {
+            [$month, $year] = $this->extractMonthYearFromDate($entry['datapagamento']);
+            if ($month && $year) {
+                $fullReference = "{$month}/{$year}";
+            }
+        }
+
+        if ((!$month || !$year) && isset($entry['dataevento'])) {
+            [$month, $year] = $this->extractMonthYearFromDate($entry['dataevento']);
+            if ($month && $year) {
+                $fullReference = "{$month}/{$year}";
+            }
+        }
+
+        if (!empty($references)) {
+            return $fullReference !== null && in_array($fullReference, $references, true);
+        }
+
+        if (!empty($months)) {
+            if (!$month || !in_array($month, $months, true)) {
+                return false;
+            }
+        }
+
+        if (!empty($years)) {
+            if (!$year || !in_array($year, $years, true)) {
+                return false;
+            }
+        }
+
+        if (empty($months) && empty($years)) {
+            return true;
+        }
+
+        return true;
+    }
+
+    private function extractMonthYearFromDate(?string $date): array
+    {
+        if (!$date) {
+            return [null, null];
+        }
+
+        $timestamp = strtotime($date);
+
+        if ($timestamp === false) {
+            return [null, null];
+        }
+
+        return [
+            date('m', $timestamp),
+            date('Y', $timestamp),
+        ];
+    }
+
+    private function normalizeText(?string $value): string
+    {
+        if ($value === null) {
+            return '';
+        }
+
+        $normalized = Str::ascii((string) $value);
+        $normalized = Str::lower($normalized);
+        $normalized = preg_replace('/\s+/', ' ', $normalized ?? '');
+
+        return trim($normalized ?? '');
     }
 
     private function storeIntent(string $conversationId, string $intent): void
