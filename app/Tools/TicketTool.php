@@ -55,6 +55,7 @@ class TicketTool extends Tool
         }
 
         $this->clearTicketData();
+        $this->clearTicketError();
 
         $pinResult = $this->generatePinSafely($cpf);
         if (!$pinResult['success']) {
@@ -73,44 +74,78 @@ class TicketTool extends Tool
 
             if ($responseCollection['result']['quantidade'] !== 0){
 
-                $arrayTemp = [];
+                $tickets = [];
+                $availableCount = 0;
+                $unavailableCount = 0;
+                $unavailableDetails = [];
 
                 //Busca informação do boleto do cliente
                 $url = env('CLIENT_API_BASE_URL').'/tsmboletos/boleto';
 
-                foreach ($responseCollection['result']['cobrancas'] as $key => $cobranca) {
+                foreach ($responseCollection['result']['cobrancas'] as $cobranca) {
                     $codigocobranca = $cobranca['codigo'];
 
                     $data = ['cpf' => $cpf, 'codigocobranca' => $codigocobranca, 'pin' => $pin];
                     $responseTicket = $this->apiService->apiConsumer($data, $url);
 
                     if ($responseTicket['success']){
-                        array_push($arrayTemp, $responseTicket['result']);
-                    } else {
-                        $handled = $this->handleTicketErrorResponse($responseTicket);
-                        if ($handled) {
-                            $this->signalTicketError($handled['code'], $handled['detail'] ?? null);
-                            $this->storeTicketData([]);
-                            return $handled['message'];
-                        }
+                        $tickets[] = $this->buildAvailableTicket($cobranca, $responseTicket['result']);
+                        $availableCount++;
+                        continue;
                     }
+
+                    $handled = $this->handleTicketErrorResponse($responseTicket);
+                    if ($handled && $handled['code'] === 'boleto_indisponivel') {
+                        $tickets[] = $this->buildUnavailableTicket(
+                            $cobranca,
+                            $handled['message'] ?? 'Boleto indisponível.',
+                            $handled['detail'] ?? null
+                        );
+                        $unavailableCount++;
+                        if (!empty($handled['detail'])) {
+                            $unavailableDetails[] = $handled['detail'];
+                        }
+                        continue;
+                    }
+
+                    if ($handled) {
+                        $this->signalTicketError($handled['code'], $handled['detail'] ?? null);
+                        $this->storeTicketData([]);
+                        return $handled['message'];
+                    }
+
+                    $this->signalTicketError('technical_error');
+                    $this->storeTicketData([]);
+                    return "Erro técnico ao consultar boletos.";
                 }
-                if (!empty($arrayTemp)){
-                    $tickets = $this->formatTicketResponse($arrayTemp);
-                }else{
-                    $tickets = [];
+
+                if (empty($tickets)) {
+                    $this->storeTicketData([]);
+                    return "Nenhum boleto encontrado para o CPF {$cpf}.";
                 }
 
                 $this->storeTicketData($tickets);
 
-                if (!empty($tickets)) {
-                    $count = count($tickets);
-                    return $count > 1
-                        ? "Boletos encontrados: {$count}. Lista pronta para exibição."
+                if ($availableCount > 0 && $unavailableCount === 0) {
+                    $this->clearTicketError();
+                    return $availableCount > 1
+                        ? "Boletos encontrados: {$availableCount}. Lista pronta para exibição."
                         : "Boleto encontrado. Lista pronta para exibição.";
                 }
 
-                return "Nenhum boleto encontrado para o CPF {$cpf}.";
+                if ($availableCount > 0 && $unavailableCount > 0) {
+                    $this->clearTicketError();
+                    $total = $availableCount + $unavailableCount;
+                    return "Localizei {$total} cobranças: {$availableCount} boleto(s) em aberto e {$unavailableCount} vencido(s). Copie a linha digitável dos disponíveis para pagar no app do banco; o link fica válido por 1 hora. Os vencidos mostram o motivo na lista.";
+                }
+
+                // Somente indisponíveis
+                $detail = null;
+                if (!empty($unavailableDetails)) {
+                    $detail = implode(', ', array_unique($unavailableDetails));
+                }
+                $this->signalTicketError('boleto_indisponivel', $detail);
+                return "Não consegui gerar boletos; todos estão indisponíveis (vencidos). Os motivos estão apresentados na lista.";
 
             } else {
 
@@ -131,36 +166,6 @@ class TicketTool extends Tool
             return "Não foi possível consultar o boleto para o CPF {$cpf}, ocorreu um erro técnico.";
         }
     }
-
-    private function formatTicketResponse($ticketsData)
-    {
-        $tickets = [];
-
-        foreach ($ticketsData as $ticket) {
-            if (isset($ticket['message'])) {
-                continue;
-            }
-
-            if (isset($ticket['linhaDigitavel']) && isset($ticket['boleto'])) {
-                // Gerar token único para o boleto
-                $token = Str::random(32);
-
-                // Armazenar o base64 no cache por 1 hora
-                Cache::put("boleto_pdf_{$token}", $ticket['boleto'], 3600);
-
-                // Gerar link para download
-                $downloadLink = url("/api/boleto/download/{$token}");
-
-                $tickets[] = [
-                    'linha_digitavel' => $this->formatLinhaDigitavel($ticket['linhaDigitavel']),
-                    'link' => $downloadLink,
-                ];
-            }
-        }
-
-        return $tickets;
-    }
-
 
     private function formatLinhaDigitavel($linha)
     {
@@ -371,5 +376,66 @@ class TicketTool extends Tool
         } else {
             Cache::forget("conv:{$this->conversationId}:ticket_error_detail");
         }
+    }
+
+    private function clearTicketError(): void
+    {
+        if (!$this->conversationId) {
+            return;
+        }
+
+        Cache::forget("conv:{$this->conversationId}:ticket_error");
+        Cache::forget("conv:{$this->conversationId}:ticket_error_detail");
+    }
+
+    private function buildAvailableTicket(array $cobranca, array $ticketData): array
+    {
+        $linhaDigitavel = $ticketData['linhaDigitavel'] ?? $cobranca['linhaDigitavel'] ?? '';
+        $linhaDigitavel = $linhaDigitavel ?? '';
+        $formattedLinha = $linhaDigitavel !== '' ? $this->formatLinhaDigitavel($linhaDigitavel) : null;
+
+        $boletoBase64 = $ticketData['boleto'] ?? null;
+        $downloadLink = null;
+
+        if ($boletoBase64) {
+            $token = Str::random(32);
+            Cache::put("boleto_pdf_{$token}", $boletoBase64, 3600);
+            $downloadLink = url("/api/boleto/download/{$token}");
+        }
+
+        return [
+            'status' => 'disponivel',
+            'linha_digitavel' => $formattedLinha,
+            'link' => $downloadLink,
+            'mensagem' => null,
+            'referencia' => $cobranca['referencia'] ?? null,
+            'numeroBoleto' => $cobranca['numeroBoleto'] ?? null,
+            'valorDocumento' => $cobranca['valorDocumento'] ?? null,
+            'dataVencimento' => $cobranca['dataVencimento'] ?? null,
+            'operadora' => $cobranca['operadora'] ?? null,
+            'prazoEmissaoVencido' => $cobranca['prazoEmissaoVencido'] ?? null,
+            //'linhaDigitavel' => $linhaDigitavel ?: ($cobranca['linhaDigitavel'] ?? null),
+        ];
+    }
+
+    private function buildUnavailableTicket(array $cobranca, string $message, ?string $detail): array
+    {
+        $linhaDigitavel = $cobranca['linhaDigitavel'] ?? null;
+        $fullMessage = trim($message . ' ' . ($detail ?? ''));
+
+        return [
+            'status' => 'indisponivel',
+            'linhaDigitavel' => $linhaDigitavel,
+            'link' => null,
+            'mensagem' => $fullMessage !== '' ? $fullMessage : $message,
+            'referencia' => $cobranca['referencia'] ?? null,
+            'numeroBoleto' => $cobranca['numeroBoleto'] ?? null,
+            'valorDocumento' => $cobranca['valorDocumento'] ?? null,
+            'dataVencimento' => $cobranca['dataVencimento'] ?? null,
+            'operadora' => $cobranca['operadora'] ?? null,
+            'prazoEmissaoVencido' => $cobranca['prazoEmissaoVencido'] ?? null,
+            //'linha_digitavel' => $linhaDigitavel ? $this->formatLinhaDigitavel($linhaDigitavel) : null,
+            //'detalhe' => $detail,
+        ];
     }
 }
