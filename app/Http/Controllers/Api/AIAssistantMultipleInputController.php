@@ -370,6 +370,15 @@ class AIAssistantMultipleInputController extends Controller
         } else {
             if ($intent === 'card') {
                 $payload['login'] = $shouldShowLogin;
+
+                if ($shouldShowLogin) {
+                    $payloadRequest = $this->getStoredPayloadRequest($conversationId);
+                    $requestedFields = $payloadRequest['fields'] ?? [];
+
+                    if ($this->messageContradictsLogin($payload['text'] ?? '')) {
+                        $payload['text'] = $this->buildLoginReminderMessage($requestedFields);
+                    }
+                }
             }
         }
 
@@ -963,6 +972,61 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         return implode(' ', array_unique($messages));
+    }
+
+    private function messageContradictsLogin(string $text): bool
+    {
+        if ($text === '') {
+            return false;
+        }
+
+        $normalized = Str::ascii(strip_tags($text));
+        $normalized = Str::lower($normalized);
+        $keywords = [
+            'localizei',
+            'localizado',
+            'localizados',
+            'localizada',
+            'localizadas',
+            'encontrei',
+            'exibi',
+            'exibida',
+            'exibidas',
+            'exibidos',
+            'na tela',
+            'estao visiveis',
+            'estao na tela',
+        ];
+
+        foreach ($keywords as $keyword) {
+            if (!str_contains($normalized, $keyword)) {
+                continue;
+            }
+
+            if (preg_match('/\bnao\s+' . preg_quote($keyword, '/') . '\b/', $normalized)) {
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private function buildLoginReminderMessage(array $requestedFields): string
+    {
+        $primaryField = $this->determinePrimaryCardField($requestedFields);
+
+        $labels = [
+            'planos' => 'seus planos',
+            'fichafinanceira' => 'seu relatório financeiro',
+            'coparticipacao' => 'sua coparticipação',
+            'beneficiarios' => 'sua carteirinha',
+        ];
+
+        $label = $labels[$primaryField] ?? 'sua carteirinha';
+
+        return "Você precisa estar logado para consultar {$label}.<br>Faça login e me avise, por favor. 🙂";
     }
 
     private function isPlansEmpty(array $plans): bool

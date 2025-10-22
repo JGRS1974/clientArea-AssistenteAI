@@ -186,7 +186,7 @@ class CardTool extends Tool
             $financial = $plano['fichafinanceira'] ?? [];
             $report[] = [
                 'plano' => $plano['contrato']['plano'] ?? '',
-                //'contrato' => $plano['contrato'] ?? [],
+                'contrato' => $plano['contrato'] ?? [],
                 'fichafinanceira' => is_array($financial) ? array_values($financial) : [],
             ];
         }
@@ -202,7 +202,7 @@ class CardTool extends Tool
             $copart = $plano['coparticipacao'] ?? [];
             $coparticipation[] = [
                 'plano' => $plano['contrato']['plano'] ?? '',
-                //'contrato' => $plano['contrato'] ?? [],
+                'contrato' => $plano['contrato'] ?? [],
                 'coparticipacao' => is_array($copart) ? array_values($copart) : [],
             ];
         }
