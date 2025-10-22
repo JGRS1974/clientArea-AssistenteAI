@@ -6,6 +6,7 @@ use Throwable;
 use Prism\Prism\Prism;
 use App\Tools\CardTool;
 use App\Tools\TicketTool;
+use App\Tools\IrInformTool;
 use Illuminate\Http\Request;
 use Prism\Prism\Enums\Provider;
 use Illuminate\Support\Facades\Log;
@@ -26,6 +27,7 @@ class AIAssistantMultipleInputController extends Controller
 {
     protected $ticketTool;
     protected $cardTool;
+    protected $irInformTool;
     protected $conversationIdService;
     protected $conversationService;
     protected $audioTranscriptionService;
@@ -35,6 +37,7 @@ class AIAssistantMultipleInputController extends Controller
     public function __construct(
         TicketTool $ticketTool,
         CardTool $cardTool,
+        IrInformTool $irInformTool,
         ConversationIdService $conversationIdService,
         ConversationService $conversationService,
         AudioTranscriptionService $audioTranscriptionService,
@@ -43,6 +46,7 @@ class AIAssistantMultipleInputController extends Controller
     ) {
         $this->ticketTool = $ticketTool;
         $this->cardTool = $cardTool;
+        $this->irInformTool = $irInformTool;
         $this->conversationIdService = $conversationIdService;
         $this->conversationService = $conversationService;
         $this->audioTranscriptionService = $audioTranscriptionService;
@@ -69,6 +73,7 @@ class AIAssistantMultipleInputController extends Controller
         $this->syncKwStatusWithHeader($conversationId, $kw);
         $this->ticketTool->setConversationId($conversationId);
         $this->cardTool->setConversationId($conversationId);
+        $this->irInformTool->setConversationId($conversationId);
         $this->resetConversationToolState($conversationId);
 
         //Verifica se foi enviada a chave de acesso no sistema após login
@@ -177,6 +182,7 @@ class AIAssistantMultipleInputController extends Controller
 
         // Monta mensagens para o Prism
         $this->cardTool->setKw($kw);
+        $this->irInformTool->setKw($kw);
 
         $payloadRequest = $this->getStoredPayloadRequest($conversationId);
         $requestedFields = $payloadRequest['fields'] ?? [];
@@ -215,6 +221,7 @@ class AIAssistantMultipleInputController extends Controller
             if ($storedCpf) {
                 $tools[] = $this->ticketTool;
                 $tools[] = $this->cardTool;
+                $tools[] = $this->irInformTool;
             }
 
             $response = Prism::text()
@@ -367,6 +374,18 @@ class AIAssistantMultipleInputController extends Controller
             );
 
             $this->clearStoredPayloadRequest($conversationId);
+        } elseif ($lastTool === 'ir') {
+            $payload['login'] = $shouldShowLogin;
+
+            $listaKey = $this->getConversationCacheKey($conversationId, 'ir_documentos');
+            $lista = $listaKey ? Cache::pull($listaKey) : null;
+
+            if (is_array($lista)) {
+                $payload['ir'] = [
+                    'quantidade' => $lista['quantidade'] ?? 0,
+                    'documentos' => $lista['documentos'] ?? [],
+                ];
+            }
         } else {
             if ($intent === 'card') {
                 $payload['login'] = $shouldShowLogin;
@@ -378,6 +397,12 @@ class AIAssistantMultipleInputController extends Controller
                     if ($this->messageContradictsLogin($payload['text'] ?? '')) {
                         $payload['text'] = $this->buildLoginReminderMessage($requestedFields);
                     }
+                }
+            } elseif ($intent === 'ir') {
+                $payload['login'] = $shouldShowLogin;
+
+                if ($shouldShowLogin && $this->messageContradictsLogin($payload['text'] ?? '')) {
+                    $payload['text'] = $this->buildIrLoginReminderMessage();
                 }
             }
         }
@@ -403,6 +428,14 @@ class AIAssistantMultipleInputController extends Controller
 
         if (preg_match('/\b(boleto|segunda via|2a via|fatura|pagamento)\b/u', $normalized)) {
             return 'ticket';
+        }
+
+        $isIrIntent =
+            preg_match('/\b(informe\s*(?:de)?\s*rendimentos?|informe\s*ir|irpf|imposto\s*de\s*renda|declara[cç][aã]o\s*de\s*ir|comprovante\s*ir|demonstrativo\s*de\s*pagamentos|demostrativo\s*de\s*pagamentos)\b/u', $normalized) ||
+            preg_match('/\b(?:o|seu|meu)\s*ir\b/u', $normalized);
+
+        if ($isIrIntent) {
+            return 'ir';
         }
 
         $isCardIntent =
@@ -1027,6 +1060,11 @@ class AIAssistantMultipleInputController extends Controller
         $label = $labels[$primaryField] ?? 'sua carteirinha';
 
         return "Você precisa estar logado para consultar {$label}.<br>Faça login e me avise, por favor. 🙂";
+    }
+
+    private function buildIrLoginReminderMessage(): string
+    {
+        return "Você precisa estar logado para consultar seu informe de rendimentos.<br>Faça login e me avise, por favor. 🙂";
     }
 
     private function isPlansEmpty(array $plans): bool
