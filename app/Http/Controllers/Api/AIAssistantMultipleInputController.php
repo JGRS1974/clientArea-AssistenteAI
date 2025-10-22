@@ -312,6 +312,7 @@ class AIAssistantMultipleInputController extends Controller
             $tickets = Cache::get($ticketsKey);
             if (is_array($tickets)) {
                 $payload['boletos'] = $tickets;
+                $payload['text'] = $this->adjustTicketText($payload['text'], $tickets);
             }
             Cache::forget($ticketsKey);
         } elseif ($lastTool === 'card') {
@@ -323,6 +324,7 @@ class AIAssistantMultipleInputController extends Controller
             $periodFilters = $payloadRequest['period_filters'] ?? [];
 
             $requestedFields = array_values(array_unique(array_filter($requestedFields)));
+            $originalText = $payload['text'];
 
             $dataMap = [
                 'beneficiarios' => 'beneficiarios',
@@ -357,6 +359,12 @@ class AIAssistantMultipleInputController extends Controller
 
                 $payload[$field] = $data;
             }
+
+            $payload['text'] = $this->adjustCardText(
+                $originalText,
+                $payload,
+                $requestedFields
+            );
 
             $this->clearStoredPayloadRequest($conversationId);
         } else {
@@ -872,6 +880,157 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         return !$hasAnyFilter;
+    }
+
+    private function adjustTicketText(string $originalText, array $tickets): string
+    {
+        if (empty($tickets)) {
+            return "Não encontrei boletos disponíveis no momento.<br>Posso ajudar em mais alguma coisa?";
+        }
+
+        $available = 0;
+        $unavailable = 0;
+
+        foreach ($tickets as $ticket) {
+            $status = $ticket['status'] ?? null;
+            if ($status === 'disponivel') {
+                $available++;
+            } elseif ($status === 'indisponivel') {
+                $unavailable++;
+            }
+        }
+
+        if ($available > 0 && $unavailable === 0) {
+            return $originalText;
+        }
+
+        if ($available > 0 && $unavailable > 0) {
+            return "Encontrei boletos em aberto e outros vencidos. Os indisponíveis mostram o motivo na lista.<br>Posso ajudar em mais alguma coisa?";
+        }
+
+        if ($available === 0 && $unavailable > 0) {
+            return "Não encontrei boletos disponíveis; os registros atuais estão vencidos.<br>Posso ajudar em mais alguma coisa?";
+        }
+
+        return $originalText;
+    }
+
+    private function adjustCardText(string $originalText, array $payload, array $requestedFields): string
+    {
+        $fields = array_values(array_intersect($requestedFields, ['planos', 'fichafinanceira', 'coparticipacao', 'beneficiarios']));
+
+        if (empty($fields)) {
+            return $originalText;
+        }
+
+        $messages = [];
+
+        foreach ($fields as $field) {
+            $data = $payload[$field] ?? [];
+
+            switch ($field) {
+                case 'planos':
+                    if ($this->isPlansEmpty($data)) {
+                        $messages[] = "Não encontrei planos associados ao seu CPF.<br>Posso ajudar em mais alguma coisa?";
+                    }
+                    break;
+                case 'beneficiarios':
+                    if ($this->isBeneficiariesEmpty($data)) {
+                        $messages[] = "Não encontrei carteirinhas vinculadas ao seu CPF.<br>Posso ajudar em mais alguma coisa?";
+                    }
+                    break;
+                case 'fichafinanceira':
+                    $emptyState = $this->analyzeFinancialData($data);
+                    if ($emptyState === 'all_empty') {
+                        $messages[] = "Não encontrei informações financeiras para esta consulta.<br>Posso ajudar em mais alguma coisa?";
+                    } elseif ($emptyState === 'partial_empty') {
+                        $messages[] = "Mostrei os lançamentos disponíveis; alguns planos não possuem registros.<br>Posso ajudar em mais alguma coisa?";
+                    }
+                    break;
+                case 'coparticipacao':
+                    $emptyState = $this->analyzeCoparticipationData($data);
+                    if ($emptyState === 'all_empty') {
+                        $messages[] = "Não encontrei registros de coparticipação para esta consulta.<br>Posso ajudar em mais alguma coisa?";
+                    } elseif ($emptyState === 'partial_empty') {
+                        $messages[] = "Exibi as coparticipações disponíveis; alguns planos não possuem registros.<br>Posso ajudar em mais alguma coisa?";
+                    }
+                    break;
+            }
+        }
+
+        if (empty($messages)) {
+            return $originalText;
+        }
+
+        return implode(' ', array_unique($messages));
+    }
+
+    private function isPlansEmpty(array $plans): bool
+    {
+        return empty($plans);
+    }
+
+    private function isBeneficiariesEmpty(array $beneficiaries): bool
+    {
+        return empty($beneficiaries);
+    }
+
+    private function analyzeFinancialData(array $financial): string
+    {
+        if (empty($financial)) {
+            return 'all_empty';
+        }
+
+        $hasData = false;
+        $hasEmpty = false;
+
+        foreach ($financial as $item) {
+            $entries = $item['fichafinanceira'] ?? [];
+            if (!empty($entries)) {
+                $hasData = true;
+            } else {
+                $hasEmpty = true;
+            }
+        }
+
+        if ($hasData && $hasEmpty) {
+            return 'partial_empty';
+        }
+
+        if (!$hasData) {
+            return 'all_empty';
+        }
+
+        return 'ok';
+    }
+
+    private function analyzeCoparticipationData(array $coparticipacao): string
+    {
+        if (empty($coparticipacao)) {
+            return 'all_empty';
+        }
+
+        $hasData = false;
+        $hasEmpty = false;
+
+        foreach ($coparticipacao as $item) {
+            $entries = $item['coparticipacao'] ?? [];
+            if (!empty($entries)) {
+                $hasData = true;
+            } else {
+                $hasEmpty = true;
+            }
+        }
+
+        if ($hasData && $hasEmpty) {
+            return 'partial_empty';
+        }
+
+        if (!$hasData) {
+            return 'all_empty';
+        }
+
+        return 'ok';
     }
 
     private function matchesPeriodFilter(array $entry, array $references, array $months, array $years): bool

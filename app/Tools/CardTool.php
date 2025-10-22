@@ -151,10 +151,15 @@ class CardTool extends Tool
                     'datanascimento' => $this->formatBirthDate($beneficiario['datanascimento'] ?? null),
                     'numerocarteira' => $beneficiario['numerocarteira'],
                     'numerocarteiraodonto' => $beneficiario['numerocarteiraodonto'] ?? '',
+                    'entidade' => $plano['contrato']['entidade'] ?? '',
+                    'operadora' => $plano['contrato']['operadora'] ?? '',
+                    'plano' => $plano['contrato']['plano'] ?? '',
+                    'coparticipacao' => $plano['contrato']['coparticipacao'] ?? '',
+                    'datavigencia' => date('m-d-Y', strtotime($plano['contrato']['datavigencia'])) ?? ''
                 ];
             }
         }
-        Log::info('Beneficiarios', $beneficiariesInformation);
+        //Log::info('Beneficiarios', $beneficiariesInformation);
         return $beneficiariesInformation;
     }
 
@@ -169,7 +174,7 @@ class CardTool extends Tool
                 $contracts[] = $contract;
             }
         }
-        Log::info('planos', $contracts);
+        //Log::info('planos', $contracts);
         return $contracts;
     }
 
@@ -185,7 +190,7 @@ class CardTool extends Tool
                 'fichafinanceira' => is_array($financial) ? array_values($financial) : [],
             ];
         }
-        Log::info('financeiro', $report);
+        //Log::info('financeiro', $report);
         return $report;
     }
 
@@ -201,7 +206,7 @@ class CardTool extends Tool
                 'coparticipacao' => is_array($copart) ? array_values($copart) : [],
             ];
         }
-        Log::info('coparticipacao', $coparticipation);
+        //Log::info('coparticipacao', $coparticipation);
         return $coparticipation;
     }
 
@@ -265,7 +270,7 @@ class CardTool extends Tool
     {
         $statusKey = $this->getCacheKey('kw_status');
         $hashKey = $this->getCacheKey('kw_hash');
-        Log::info('kw_hash CardTool ' . $hashKey);
+        //Log::info('kw_hash CardTool ' . $hashKey);
         if (!$statusKey || !$hashKey) {
             return;
         }
