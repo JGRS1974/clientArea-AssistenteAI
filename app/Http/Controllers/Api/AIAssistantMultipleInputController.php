@@ -354,7 +354,7 @@ class AIAssistantMultipleInputController extends Controller
 
                 $data = is_array($rawData) ? $rawData : [];
 
-                if (in_array($field, ['planos', 'fichafinanceira', 'coparticipacao'], true)) {
+                if (in_array($field, ['planos', 'fichafinanceira', 'coparticipacao'], true) && $this->hasMeaningfulContractFilters($contractFilters)) {
                     $data = $this->filterCardDataByContractFilters($data, $contractFilters, $field);
                 }
 
@@ -391,6 +391,8 @@ class AIAssistantMultipleInputController extends Controller
                 ];
             }
         } else {
+            $messagesForHeuristic = $this->redisConversationService->getMessages($conversationId);
+
             if ($intent === 'card') {
                 $payload['login'] = $shouldShowLogin;
 
@@ -402,7 +404,7 @@ class AIAssistantMultipleInputController extends Controller
                         $payload['text'] = $this->buildLoginReminderMessage($requestedFields);
                     }
                 }
-            } elseif ($intent === 'ir' || ($intent === null && $this->looksLikeIrRequest($conversationMessages))) {
+            } elseif ($intent === 'ir' || ($intent === null && $this->looksLikeIrRequest($messagesForHeuristic))) {
                 $payload['login'] = $shouldShowLogin;
 
                 if ($shouldShowLogin && $this->messageContradictsLogin($payload['text'] ?? '')) {
@@ -481,9 +483,17 @@ class AIAssistantMultipleInputController extends Controller
 
         $mentionsPlansPlural = (bool) preg_match('/\bplanos\b/u', $normalized);
         $mentionsContractsPlural = (bool) preg_match('/\bcontratos\b/u', $normalized);
+        $mentionsPlanSingular = (bool) preg_match('/\bplano\b/u', $normalized);
+        $mentionsContractSingular = (bool) preg_match('/\bcontrato\b/u', $normalized);
         $explicitPlansRequest = (bool) preg_match('/\b(meus?|suas?|seus?|quais|qual|mostrar|mostre|retorne|retorna|retornar|lista|listar|ver|veja|exibir|exiba|consultar|consulte)\s+(?:os\s+|as\s+)?(planos|contratos)\b/u', $normalized);
+        $explicitPlanSingular = (bool) preg_match('/\b(meu|seu|qual|mostrar|mostre|ver|veja|consultar|consulte)\s+(?:o\s+|um\s+)?plano\b/u', $normalized);
+        $explicitContractSingular = (bool) preg_match('/\b(meu|seu|qual|mostrar|mostre|ver|veja|consultar|consulte)\s+(?:o\s+|um\s+)?contrato\b/u', $normalized);
+        $planKeywords = (bool) preg_match('/\b(plano\s*(?:atual|vigente|contratado|ativo|principal))\b/u', $normalized);
 
-        if ($explicitPlansRequest || $mentionsPlansPlural || $mentionsContractsPlural) {
+        if ($explicitPlansRequest || $mentionsPlansPlural || $mentionsContractsPlural ||
+            $mentionsPlanSingular || $mentionsContractSingular ||
+            $explicitPlanSingular || $explicitContractSingular ||
+            $planKeywords) {
             $fields[] = 'planos';
         }
 
@@ -508,7 +518,9 @@ class AIAssistantMultipleInputController extends Controller
             'numerocontrato' => [],
         ];
 
-        $filters['plan'] = $this->extractTermsByKeywords($message, ['plano', 'planos']);
+        $filters['plan'] = $this->filterPlanStopwords(
+            $this->extractTermsByKeywords($message, ['plano', 'planos'])
+        );
         $filters['entidade'] = $this->extractTermsByKeywords($message, ['entidade', 'entidades']);
         $filters['operadora'] = $this->extractTermsByKeywords($message, ['operadora', 'operadoras']);
         $filters['fantasia'] = $this->extractTermsByKeywords($message, ['fantasia', 'nome fantasia', 'operadora fantasia']);
@@ -528,6 +540,50 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         return $filters;
+    }
+
+    private function hasMeaningfulContractFilters(array $filters): bool
+    {
+        foreach (['plan', 'entidade', 'operadora', 'fantasia', 'id', 'numerocontrato'] as $key) {
+            $values = $filters[$key] ?? [];
+
+            if (empty($values)) {
+                continue;
+            }
+
+            foreach ($values as $value) {
+                $normalized = $this->normalizeText($value);
+
+                if ($normalized !== '') {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private function filterPlanStopwords(array $terms): array
+    {
+        $stopwords = [
+            'atual', 'atuais', 'vigente', 'vigentes', 'novo', 'novos', 'antigo', 'antigos',
+            'meu', 'minha', 'seu', 'sua', 'plano', 'planos', 'contrato', 'contratos', 'um', 'o',
+            'este', 'esse', 'essa', 'isso', 'aquele', 'aquela', 'principal', 'ativo', 'ativos'
+        ];
+
+        $filtered = [];
+
+        foreach ($terms as $term) {
+            $normalized = $this->normalizeText($term);
+
+            if ($normalized === '' || in_array($normalized, $stopwords, true)) {
+                continue;
+            }
+
+            $filtered[] = $term;
+        }
+
+        return $filtered;
     }
 
     private function extractTermsByKeywords(string $message, array $keywords): array
