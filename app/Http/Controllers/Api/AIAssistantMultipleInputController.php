@@ -378,7 +378,11 @@ class AIAssistantMultipleInputController extends Controller
             $payload['login'] = $shouldShowLogin;
 
             $listaKey = $this->getConversationCacheKey($conversationId, 'ir_documentos');
-            $lista = $listaKey ? Cache::pull($listaKey) : null;
+            $lista = $listaKey ? Cache::get($listaKey) : null;
+
+            if ($listaKey) {
+                Cache::forget($listaKey);
+            }
 
             if (is_array($lista)) {
                 $payload['ir'] = [
@@ -398,7 +402,7 @@ class AIAssistantMultipleInputController extends Controller
                         $payload['text'] = $this->buildLoginReminderMessage($requestedFields);
                     }
                 }
-            } elseif ($intent === 'ir') {
+            } elseif ($intent === 'ir' || ($intent === null && $this->looksLikeIrRequest($conversationMessages))) {
                 $payload['login'] = $shouldShowLogin;
 
                 if ($shouldShowLogin && $this->messageContradictsLogin($payload['text'] ?? '')) {
@@ -431,7 +435,10 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         $isIrIntent =
-            preg_match('/\b(informe\s*(?:de)?\s*rendimentos?|informe\s*ir|irpf|imposto\s*de\s*renda|declara[cç][aã]o\s*de\s*ir|comprovante\s*ir|demonstrativo\s*de\s*pagamentos|demostrativo\s*de\s*pagamentos)\b/u', $normalized) ||
+            preg_match('/\b(informes?\s*(?:de)?\s*rendimentos?)\b/u', $normalized) ||
+            preg_match('/\b(informe\s*ir|ir\s*20\d{2}|irpf)\b/u', $normalized) ||
+            preg_match('/\b(imposto\s*de\s*renda|dirf|comprovante\s*(?:do\s*)?imposto\s*de\s*renda)\b/u', $normalized) ||
+            preg_match('/\b(demonstrat(?:ivo|ivo\s*de)\s*pagament(?:o|os))\b/u', $normalized) ||
             preg_match('/\b(?:o|seu|meu)\s*ir\b/u', $normalized);
 
         if ($isIrIntent) {
@@ -1065,6 +1072,30 @@ class AIAssistantMultipleInputController extends Controller
     private function buildIrLoginReminderMessage(): string
     {
         return "Você precisa estar logado para consultar seu informe de rendimentos.<br>Faça login e me avise, por favor. 🙂";
+    }
+
+    private function looksLikeIrRequest(array $conversationMessages): bool
+    {
+        for ($i = count($conversationMessages) - 1; $i >= 0; $i--) {
+            $message = $conversationMessages[$i] ?? null;
+
+            if (!is_array($message) || ($message['role'] ?? '') !== 'user') {
+                continue;
+            }
+
+            $text = Str::lower($message['content'] ?? '');
+
+            return (bool) (
+                preg_match('/\b(irpf|imposto\s*de\s*renda|dirf)\b/u', $text) ||
+                preg_match('/\b(informes?\s*(?:de)?\s*rendimentos?)\b/u', $text) ||
+                preg_match('/\b(informe\s*ir|ir\s*20\d{2})\b/u', $text) ||
+                preg_match('/\b(comprovante\s*(?:do\s*)?imposto\s*de\s*renda)\b/u', $text) ||
+                preg_match('/\b(demonstrat(?:ivo|ivo\s*de)\s*pagament(?:o|os))\b/u', $text) ||
+                preg_match('/\b(?:o|seu|meu)\s*ir\b/u', $text)
+            );
+        }
+
+        return false;
     }
 
     private function isPlansEmpty(array $plans): bool
