@@ -3,9 +3,10 @@
 namespace App\Tools;
 
 use Prism\Prism\Tool;
-use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 use App\Services\ApiConsumerService;
 use App\Services\PinGeneratorService;
+use Illuminate\Support\Facades\Cache;
 
 class IrInformTool extends Tool
 {
@@ -75,7 +76,7 @@ class IrInformTool extends Tool
         $formattedCpf = $this->pinService->formatCpf($cpfDigits);
         $pin = $pinResult['pin'];
         $baseUrl = rtrim(env('IR_API_BASE_URL', env('CLIENT_API_BASE_URL')), '/');
-
+        //Log::info('baseUrl ir ' . $baseUrl);
         // Primeira chamada: lista de informes
         $listPayload = [
             'cpf' => $formattedCpf,
@@ -85,7 +86,7 @@ class IrInformTool extends Tool
 
         $listResponse = $this->apiService->apiConsumer($listPayload, "{$baseUrl}/v2/getListInform");
         $listHttpCode = $listResponse['httpcode'] ?? null;
-
+        //Log::info('listResponde', $listResponse);
         if ($listHttpCode === 401) {
             $this->setKwStatus('invalid', $kwValue);
             $this->clearIrData();
@@ -116,7 +117,7 @@ class IrInformTool extends Tool
         }
 
         $documentosAlvo = $this->filterDocumentosPorAno($documentos, $ano);
-
+        //Log::info('documentosAlvo', $documentosAlvo);
         if (empty($documentosAlvo)) {
             $this->setKwStatus('valid', $kwValue);
             $this->storeIrData([
@@ -145,7 +146,7 @@ class IrInformTool extends Tool
             'quantidade' => count($documentosAlvo),
             'documentos' => $documentosEnriquecidos,
         ];
-
+        //Log::info('consolidado', $consolidado);
         $this->setKwStatus('valid', $kwValue);
         $this->storeIrData($consolidado);
         $this->setLastTool();

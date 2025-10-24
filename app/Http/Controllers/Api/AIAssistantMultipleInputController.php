@@ -17,6 +17,7 @@ use App\Services\ConversationIdService;
 use App\Services\ConversationService;
 use App\Services\AudioTranscriptionService;
 use App\Services\ImageAnalysisService;
+use App\Services\AssistantMessageBuilder;
 use App\Services\RedisConversationService;
 use Prism\Prism\Exceptions\PrismException;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
@@ -33,6 +34,8 @@ class AIAssistantMultipleInputController extends Controller
     protected $audioTranscriptionService;
     protected $imageAnalysisService;
     protected $redisConversationService;
+    protected AssistantMessageBuilder $assistantMessages;
+    protected array $cardFilterDiagnostics = [];
 
     public function __construct(
         TicketTool $ticketTool,
@@ -42,7 +45,8 @@ class AIAssistantMultipleInputController extends Controller
         ConversationService $conversationService,
         AudioTranscriptionService $audioTranscriptionService,
         ImageAnalysisService $imageAnalysisService,
-        RedisConversationService $redisConversationService
+        RedisConversationService $redisConversationService,
+        AssistantMessageBuilder $assistantMessages
     ) {
         $this->ticketTool = $ticketTool;
         $this->cardTool = $cardTool;
@@ -52,6 +56,7 @@ class AIAssistantMultipleInputController extends Controller
         $this->audioTranscriptionService = $audioTranscriptionService;
         $this->imageAnalysisService = $imageAnalysisService;
         $this->redisConversationService = $redisConversationService;
+        $this->assistantMessages = $assistantMessages;
     }
 
     public function chat(Request $request)
@@ -69,7 +74,7 @@ class AIAssistantMultipleInputController extends Controller
 
         $conversationId = $this->conversationIdService->setConversationId($request);
         $kw = $request->kw;
-        Log::info('kw enviado payload ' . $kw);
+        //Log::info('kw enviado payload ' . $kw);
         $this->syncKwStatusWithHeader($conversationId, $kw);
         $this->ticketTool->setConversationId($conversationId);
         $this->cardTool->setConversationId($conversationId);
@@ -218,7 +223,9 @@ class AIAssistantMultipleInputController extends Controller
         try{
             $tools = [];
 
-            if ($storedCpf) {
+            $isLoggedIn = $statusLogin === 'usuário logado';
+
+            if ($storedCpf && $isLoggedIn) {
                 $tools[] = $this->ticketTool;
                 $tools[] = $this->cardTool;
                 $tools[] = $this->irInformTool;
@@ -313,6 +320,13 @@ class AIAssistantMultipleInputController extends Controller
         $lastTool = Cache::get($lastToolKey);
         $shouldShowLogin = $this->shouldShowLoginButton($conversationId);
         $intent = $this->getStoredIntent($conversationId);
+        $payloadRequest = $this->getStoredPayloadRequest($conversationId);
+        $requestedFields = array_values(array_unique(array_filter($payloadRequest['fields'] ?? [])));
+        $contractFilters = $payloadRequest['contract_filters'] ?? [];
+        $periodFilters = $payloadRequest['period_filters'] ?? [];
+
+        $this->assistantMessages->setConversation($conversationId, $intent);
+        $this->cardFilterDiagnostics = [];
 
         if ($lastTool === 'ticket') {
             $ticketsKey = $this->getConversationCacheKey($conversationId, 'boletos');
@@ -324,13 +338,6 @@ class AIAssistantMultipleInputController extends Controller
             Cache::forget($ticketsKey);
         } elseif ($lastTool === 'card') {
             $payload['login'] = $shouldShowLogin;
-
-            $payloadRequest = $this->getStoredPayloadRequest($conversationId);
-            $requestedFields = $payloadRequest['fields'] ?? [];
-            $contractFilters = $payloadRequest['contract_filters'] ?? [];
-            $periodFilters = $payloadRequest['period_filters'] ?? [];
-
-            $requestedFields = array_values(array_unique(array_filter($requestedFields)));
             $originalText = $payload['text'];
 
             $dataMap = [
@@ -379,7 +386,7 @@ class AIAssistantMultipleInputController extends Controller
 
             $listaKey = $this->getConversationCacheKey($conversationId, 'ir_documentos');
             $lista = $listaKey ? Cache::get($listaKey) : null;
-
+            Log::info('lista ir assistant', $lista);
             if ($listaKey) {
                 Cache::forget($listaKey);
             }
@@ -397,11 +404,10 @@ class AIAssistantMultipleInputController extends Controller
                 $payload['login'] = $shouldShowLogin;
 
                 if ($shouldShowLogin) {
-                    $payloadRequest = $this->getStoredPayloadRequest($conversationId);
-                    $requestedFields = $payloadRequest['fields'] ?? [];
+                    $text = $payload['text'] ?? '';
 
-                    if ($this->messageContradictsLogin($payload['text'] ?? '')) {
-                        $payload['text'] = $this->buildLoginReminderMessage($requestedFields);
+                    if ($this->messageContradictsLogin($text) || !$this->messageMentionsLogin($text)) {
+                        $payload['text'] = $this->buildLoginReminderMessage($conversationId, $requestedFields);
                     }
                 }
             } elseif ($intent === 'ir' || ($intent === null && $this->looksLikeIrRequest($messagesForHeuristic))) {
@@ -416,6 +422,34 @@ class AIAssistantMultipleInputController extends Controller
         Cache::forget($lastToolKey);
         Cache::forget($this->getConversationCacheKey($conversationId, 'ticket_error'));
         Cache::forget($this->getConversationCacheKey($conversationId, 'ticket_error_detail'));
+
+        return $this->enforceCpfRequirement($payload, $conversationId, $intent, $requestedFields);
+    }
+
+    private function enforceCpfRequirement(array $payload, string $conversationId, ?string $intent, array $requestedFields): array
+    {
+        if ($intent !== 'card') {
+            return $payload;
+        }
+
+        if ($this->shouldShowLoginButton($conversationId)) {
+            return $payload;
+        }
+
+        $storedCpf = $this->getStoredCpf($conversationId);
+
+        if ($storedCpf) {
+            return $payload;
+        }
+
+        $payload['cpf_required'] = true;
+
+        $text = $payload['text'] ?? '';
+
+        if (!$this->messageAsksForCpf($text)) {
+            $primaryField = $this->determinePrimaryCardField($requestedFields);
+            $payload['text'] = $this->assistantMessages->requestCpfForField($primaryField);
+        }
 
         return $payload;
     }
@@ -451,7 +485,8 @@ class AIAssistantMultipleInputController extends Controller
             preg_match('/carteir|cart[ãa]o virtual|documento digital/u', $normalized) ||
             preg_match('/\b(planos?|contratos?)\b/u', $normalized) ||
             preg_match('/relat[óo]rio\s*financeir[oa]|ficha\s*financeir[oa]|(?:meu|minha|seu|sua|o|a)?\s*financeir[oa]\b|\bfinanceir[oa]\b/u', $normalized) ||
-            preg_match('/co[-\s]?participa[cç][aã]o/u', $normalized);
+            preg_match('/co[-\s]?participa[cç][aã]o/u', $normalized) ||
+            $this->matchesPaymentsRequest($normalized);
 
         if ($isCardIntent) {
             return 'card';
@@ -468,12 +503,13 @@ class AIAssistantMultipleInputController extends Controller
         $hasCardRequest = (bool) preg_match('/carteir|cart[ãa]o virtual|documento digital/u', $normalized);
         $hasFinanceRequest = (bool) preg_match('/relat[óo]rio\s*financeir[oa]|ficha\s*financeir[oa]|(?:meu|minha|seu|sua|o|a)\s*financeir[oa]|\bfinanceir[oa]\b/u', $normalized);
         $hasCoparticipationRequest = (bool) preg_match('/co[-\s]?participa[cç][aã]o|coparticipa[cç][aã]o|\bcopart\b/u', $normalized);
+        $hasPaymentsRequest = $this->matchesPaymentsRequest($normalized);
 
         if ($hasCardRequest) {
             $fields[] = 'beneficiarios';
         }
 
-        if ($hasFinanceRequest) {
+        if ($hasFinanceRequest || $hasPaymentsRequest) {
             $fields[] = 'fichafinanceira';
         }
 
@@ -561,6 +597,18 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         return false;
+    }
+
+    private function messageMentionsLogin(?string $text): bool
+    {
+        if ($text === null || $text === '') {
+            return false;
+        }
+
+        $normalized = Str::ascii(strip_tags($text));
+        $normalized = Str::lower($normalized);
+
+        return str_contains($normalized, 'login') || str_contains($normalized, 'logar') || str_contains($normalized, 'entrar');
     }
 
     private function filterPlanStopwords(array $terms): array
@@ -864,6 +912,10 @@ class AIAssistantMultipleInputController extends Controller
             }
         }
 
+        if ($hasFilters && empty($filtered) && !empty($items)) {
+            $this->registerCardFilterMiss($field, $filters);
+        }
+
         return array_values($filtered);
     }
 
@@ -926,6 +978,24 @@ class AIAssistantMultipleInputController extends Controller
         return [$contract, $planName];
     }
 
+    private function registerCardFilterMiss(string $field, array $filters): void
+    {
+        $terms = [];
+
+        foreach ($filters as $list) {
+            foreach ($list as $value) {
+                if ($value === '') {
+                    continue;
+                }
+                $terms[] = $value;
+            }
+        }
+
+        if (!empty($terms)) {
+            $this->cardFilterDiagnostics[$field]['filter_terms'] = array_values(array_unique($terms));
+        }
+    }
+
     private function matchesContractFilters(?array $contract, ?string $planName, array $filters): bool
     {
         $normalizedPlan = $this->normalizeText($planName ?? ($contract['plano'] ?? ''));
@@ -949,6 +1019,15 @@ class AIAssistantMultipleInputController extends Controller
                 switch ($type) {
                     case 'plan':
                         if ($normalizedPlan !== '' && str_contains($normalizedPlan, $value)) {
+                            return true;
+                        }
+                        if ($normalizedEntidade !== '' && str_contains($normalizedEntidade, $value)) {
+                            return true;
+                        }
+                        if ($normalizedOperadora !== '' && str_contains($normalizedOperadora, $value)) {
+                            return true;
+                        }
+                        if ($normalizedFantasia !== '' && str_contains($normalizedFantasia, $value)) {
                             return true;
                         }
                         break;
@@ -990,7 +1069,9 @@ class AIAssistantMultipleInputController extends Controller
     private function adjustTicketText(string $originalText, array $tickets): string
     {
         if (empty($tickets)) {
-            return "Não encontrei boletos disponíveis no momento.<br>Posso ajudar em mais alguma coisa?";
+            return $this->assistantMessages->withFollowUp(
+                $this->assistantMessages->ticketNone()
+            );
         }
 
         $available = 0;
@@ -1010,11 +1091,15 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         if ($available > 0 && $unavailable > 0) {
-            return "Encontrei boletos em aberto e outros vencidos. Os indisponíveis mostram o motivo na lista.<br>Posso ajudar em mais alguma coisa?";
+            return $this->assistantMessages->withFollowUp(
+                $this->assistantMessages->ticketMixed()
+            );
         }
 
         if ($available === 0 && $unavailable > 0) {
-            return "Não encontrei boletos disponíveis; os registros atuais estão vencidos.<br>Posso ajudar em mais alguma coisa?";
+            return $this->assistantMessages->withFollowUp(
+                $this->assistantMessages->ticketExpired()
+            );
         }
 
         return $originalText;
@@ -1036,38 +1121,56 @@ class AIAssistantMultipleInputController extends Controller
             switch ($field) {
                 case 'planos':
                     if ($this->isPlansEmpty($data)) {
-                        $messages[] = "Não encontrei planos associados ao seu CPF.<br>Posso ajudar em mais alguma coisa?";
+                        $planFilterTerms = $this->cardFilterDiagnostics['planos']['filter_terms'] ?? [];
+                        if (!empty($planFilterTerms)) {
+                            $messages[] = $this->assistantMessages->cardPlanFilterMissed($planFilterTerms);
+                        } else {
+                            $messages[] = $this->assistantMessages->cardNotFound('planos');
+                        }
                     }
                     break;
                 case 'beneficiarios':
                     if ($this->isBeneficiariesEmpty($data)) {
-                        $messages[] = "Não encontrei carteirinhas vinculadas ao seu CPF.<br>Posso ajudar em mais alguma coisa?";
+                        $messages[] = $this->assistantMessages->cardNotFound('beneficiarios');
                     }
                     break;
                 case 'fichafinanceira':
                     $emptyState = $this->analyzeFinancialData($data);
                     if ($emptyState === 'all_empty') {
-                        $messages[] = "Não encontrei informações financeiras para esta consulta.<br>Posso ajudar em mais alguma coisa?";
+                        if (!empty($data)) {
+                            $messages[] = $this->assistantMessages->cardFinanceNoEntries($data);
+                        } else {
+                            $messages[] = $this->assistantMessages->cardNotFound('fichafinanceira');
+                        }
                     } elseif ($emptyState === 'partial_empty') {
-                        $messages[] = "Mostrei os lançamentos disponíveis; alguns planos não possuem registros.<br>Posso ajudar em mais alguma coisa?";
+                        $messages[] = $this->assistantMessages->cardPartial('fichafinanceira');
                     }
                     break;
                 case 'coparticipacao':
                     $emptyState = $this->analyzeCoparticipationData($data);
                     if ($emptyState === 'all_empty') {
-                        $messages[] = "Não encontrei registros de coparticipação para esta consulta.<br>Posso ajudar em mais alguma coisa?";
+                        if (!empty($data)) {
+                            $messages[] = $this->assistantMessages->cardCoparticipationNoEntries($data);
+                        } else {
+                            $messages[] = $this->assistantMessages->cardNotFound('coparticipacao');
+                        }
                     } elseif ($emptyState === 'partial_empty') {
-                        $messages[] = "Exibi as coparticipações disponíveis; alguns planos não possuem registros.<br>Posso ajudar em mais alguma coisa?";
+                        $messages[] = $this->assistantMessages->cardPartial('coparticipacao');
                     }
                     break;
             }
         }
 
+        $messages = array_values(array_unique(array_filter($messages)));
+
         if (empty($messages)) {
             return $originalText;
         }
 
-        return implode(' ', array_unique($messages));
+        $lineBreak = (string) config('assistant.line_break', '<br>');
+        $joined = implode($lineBreak, $messages);
+
+        return $this->assistantMessages->withFollowUp($joined);
     }
 
     private function messageContradictsLogin(string $text): bool
@@ -1109,25 +1212,70 @@ class AIAssistantMultipleInputController extends Controller
         return false;
     }
 
-    private function buildLoginReminderMessage(array $requestedFields): string
+    private function messageAsksForCpf(?string $text): bool
+    {
+        if ($text === null || $text === '') {
+            return false;
+        }
+
+        $normalized = Str::ascii(strip_tags($text));
+        $normalized = Str::lower($normalized);
+
+        return str_contains($normalized, 'cpf');
+    }
+
+    private function buildLoginReminderMessage(string $conversationId, array $requestedFields): string
     {
         $primaryField = $this->determinePrimaryCardField($requestedFields);
 
-        $labels = [
-            'planos' => 'seus planos',
-            'fichafinanceira' => 'seu relatório financeiro',
-            'coparticipacao' => 'sua coparticipação',
-            'beneficiarios' => 'sua carteirinha',
+        $allowedFields = ['planos', 'fichafinanceira', 'coparticipacao', 'beneficiarios'];
+        $labelKey = in_array($primaryField, $allowedFields, true) ? $primaryField : 'beneficiarios';
+        $storedCpf = $this->getStoredCpf($conversationId);
+
+        $context = [
+            'requested_fields' => $requestedFields,
+            'label_key' => $labelKey,
         ];
 
-        $label = $labels[$primaryField] ?? 'sua carteirinha';
+        if (!$storedCpf) {
+            return $this->assistantMessages->loginRequiredWithCpf($labelKey, $context);
+        }
 
-        return "Você precisa estar logado para consultar {$label}.<br>Faça login e me avise, por favor. 🙂";
+        return $this->assistantMessages->loginRequired($labelKey, $context);
     }
 
     private function buildIrLoginReminderMessage(): string
     {
-        return "Você precisa estar logado para consultar seu informe de rendimentos.<br>Faça login e me avise, por favor. 🙂";
+        return $this->assistantMessages->loginRequiredIr();
+    }
+
+    private function matchesPaymentsRequest(string $normalized): bool
+    {
+        if (!str_contains($normalized, 'pagament')) {
+            return false;
+        }
+
+        $patterns = [
+            '/\\bmeus?\\s+pagamentos\\b/u',
+            '/\\bseus?\\s+pagamentos\\b/u',
+            '/\\bconsult(ar|e|o)\\s+(?:os\\s+)?pagamentos\\b/u',
+            '/\\bmostrar\\s+(?:os\\s+)?pagamentos\\b/u',
+            '/\\bmostre\\s+(?:os\\s+)?pagamentos\\b/u',
+            '/\\bver\\s+(?:os\\s+)?pagamentos\\b/u',
+            '/\\blistar\\s+(?:os\\s+)?pagamentos\\b/u',
+            '/\\bextrato\\s+(?:de\\s+)?pagamentos\\b/u',
+            '/\\bhist[óo]rico\\s+(?:de\\s+)?pagamentos\\b/u',
+            '/\\bpagamentos\\s+(?:do|da|dos|das)\\b/u',
+            '/\\bpagamentos\\b/u',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $normalized)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function looksLikeIrRequest(array $conversationMessages): bool

@@ -196,7 +196,7 @@ class ApiConsumerService
                 'httpcode' => $response['httpcode'],
                 'responseTime' => $response['responseTime'],
                 'success' => $response['success'],
-                'result' => $response['success'] !== true ? $response['result'] : null,
+                //'result' => $response['success'] == true ? $response['result'] : null,
                 'error' => $response['error'] ?? null
             ]);
         }
