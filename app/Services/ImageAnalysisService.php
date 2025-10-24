@@ -9,7 +9,6 @@ use Prism\Prism\Enums\Provider;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\Media\Image;
 use Prism\Prism\ValueObjects\Media\Text;
-use function PHPUnit\Framework\fileExists;
 use Prism\Prism\Exceptions\PrismException;
 use Exception;
 
@@ -52,7 +51,9 @@ class ImageAnalysisService
             throw new Exception('Falha na análise da imagem: ' . $e->getMessage());
         } finally {
             // Remove arquivo temporário
-            if (fileExists($tempPath)) unlink($tempPath);
+            if (file_exists($tempPath)) {
+                unlink($tempPath);
+            }
             //Storage::delete(str_replace(storage_path('app/'), '', $tempPath));
         }
     }
@@ -78,7 +79,9 @@ class ImageAnalysisService
 
         } finally {
             // Remove arquivo temporário
-            if (fileExists($tempPath)) unlink($tempPath);
+            if (file_exists($tempPath)) {
+                unlink($tempPath);
+            }
             //Storage::delete(str_replace(storage_path('app/'), '', $tempPath));
         }
     }
@@ -108,7 +111,9 @@ class ImageAnalysisService
                     ->asText();
 
                 // Remove arquivo de imagem temporário
-                if (fileExists($imagePath)) unlink($imagePath);
+                if (file_exists($imagePath)) {
+                    unlink($imagePath);
+                }
 
                 return $response->text;
             }

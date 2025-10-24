@@ -10,7 +10,6 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Prism\Prism\ValueObjects\Media\Audio;
 
-use function PHPUnit\Framework\fileExists;
 use Prism\Prism\Exceptions\PrismException;
 
 class AudioTranscriptionService
@@ -51,7 +50,9 @@ class AudioTranscriptionService
             throw new Exception('Falha na transcrição: ' . $e->getMessage());
         } finally {
             // Remove arquivo temporário
-            if (fileExists($tempPath)) unlink($tempPath);
+            if (file_exists($tempPath)) {
+                unlink($tempPath);
+            }
             //Storage::delete($tempPath);
         }
     }
