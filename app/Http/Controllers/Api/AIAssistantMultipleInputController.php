@@ -225,8 +225,11 @@ class AIAssistantMultipleInputController extends Controller
 
             $isLoggedIn = $statusLogin === 'usuário logado';
 
-            if ($storedCpf && $isLoggedIn) {
+            if ($storedCpf) {
                 $tools[] = $this->ticketTool;
+            }
+
+            if ($storedCpf && $isLoggedIn) {
                 $tools[] = $this->cardTool;
                 $tools[] = $this->irInformTool;
             }
@@ -401,17 +404,21 @@ class AIAssistantMultipleInputController extends Controller
             $messagesForHeuristic = $this->redisConversationService->getMessages($conversationId);
 
             if ($intent === 'card') {
-                $payload['login'] = $shouldShowLogin;
+            $payload['login'] = $shouldShowLogin;
 
-                if ($shouldShowLogin) {
-                    $text = $payload['text'] ?? '';
+            if ($shouldShowLogin) {
+                $text = $payload['text'] ?? '';
 
-                    if ($this->messageContradictsLogin($text) || !$this->messageMentionsLogin($text)) {
-                        $payload['text'] = $this->buildLoginReminderMessage($conversationId, $requestedFields);
-                    }
+                if (
+                    $this->messageContradictsLogin($text) ||
+                    !$this->messageMentionsLogin($text) ||
+                    $this->messageAsksForCpf($text)
+                ) {
+                    $payload['text'] = $this->buildLoginReminderMessage($conversationId, $requestedFields);
                 }
-            } elseif ($intent === 'ir' || ($intent === null && $this->looksLikeIrRequest($messagesForHeuristic))) {
-                $payload['login'] = $shouldShowLogin;
+            }
+        } elseif ($intent === 'ir' || ($intent === null && $this->looksLikeIrRequest($messagesForHeuristic))) {
+            $payload['login'] = $shouldShowLogin;
 
                 if ($shouldShowLogin && $this->messageContradictsLogin($payload['text'] ?? '')) {
                     $payload['text'] = $this->buildIrLoginReminderMessage();
@@ -1230,16 +1237,10 @@ class AIAssistantMultipleInputController extends Controller
 
         $allowedFields = ['planos', 'fichafinanceira', 'coparticipacao', 'beneficiarios'];
         $labelKey = in_array($primaryField, $allowedFields, true) ? $primaryField : 'beneficiarios';
-        $storedCpf = $this->getStoredCpf($conversationId);
-
         $context = [
             'requested_fields' => $requestedFields,
             'label_key' => $labelKey,
         ];
-
-        if (!$storedCpf) {
-            return $this->assistantMessages->loginRequiredWithCpf($labelKey, $context);
-        }
 
         return $this->assistantMessages->loginRequired($labelKey, $context);
     }

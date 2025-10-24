@@ -154,13 +154,6 @@ class AssistantMessageBuilder
         return $this->render('assistant.login.required.generic', ['label' => $label], $context + ['label' => $label]);
     }
 
-    public function loginRequiredWithCpf(string $labelKeyOrValue, array $context = []): string
-    {
-        $label = $this->resolveLabel($labelKeyOrValue);
-
-        return $this->render('assistant.login.required.combined', ['label' => $label], $context + ['label' => $label]);
-    }
-
     public function loginRequiredIr(array $context = []): string
     {
         return $this->render('assistant.login.required.ir', [], $context);

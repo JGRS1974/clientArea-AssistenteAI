@@ -13,12 +13,9 @@ return [
         'required' => [
             'generic' => [
                 'Você precisa estar logado para consultar :label.<br>Faça login e me avise, por favor. 🙂',
-                'Faça login e me avise quando terminar para eu mostrar :label. Obrigada.',
-            ],
-            'combined' => [
-                'Você precisa estar logado para consultar :label.<br>Faça login e me avise e envie seu CPF (somente números), por favor. 🙂',
-                'Para liberar :label, faça login e me avise e envie seu CPF (somente números), por favor. Obrigada.',
-                'Faça login para consultar :label.<br>Quando concluir, me avise e envie seu CPF (somente números), por favor. Obrigada. 🙂',
+                'Você precisa estar logado para consultar :label.<br>Faça login e me avise, obrigada.',
+                'Para acessar :label, faça login e me avise quando concluir. Obrigada. 🙂',
+                'Faça login para liberar :label e me avise ao terminar, por favor. 🙂',
             ],
             'ir' => [
                 'Você precisa estar logado para consultar seu informe de rendimentos.<br>Faça login e me avise, por favor. 🙂',
