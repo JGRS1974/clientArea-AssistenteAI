@@ -76,6 +76,42 @@ class WhatsAppWebhookController extends Controller
         $recipientDigits = preg_replace('/\D/', '', $phone);
         $isSelfChat = ($instancePhone !== '' && $recipientDigits === $instancePhone);
 
+        // Gate de manutenção (saída antecipada): responda com uma mensagem curta e ignore o processamento.
+        try {
+            if ($this->isMaintenanceOnForChannel('whatsapp')) {
+                // Checar whitelist
+                $whitelist = array_values(array_filter(array_map(function ($v) {
+                    return preg_replace('/\D/', '', trim((string)$v));
+                }, explode(',', (string) env('MAINTENANCE_WHITELIST', '')))));
+                $num = preg_replace('/\D/', '', $phone);
+                $isWhitelisted = ($num !== '' && in_array($num, $whitelist, true));
+
+                // Responder a si mesmo?
+                $respondSelf = $this->envBool('MAINTENANCE_RESPOND_SELF', true);
+                if ($isWhitelisted || ($isSelfChat && !$respondSelf)) {
+                    // Ignorar resposta de manutenção
+                } else {
+                    // Tempo de espera por número
+                    $cooldown = (int) env('MAINTENANCE_COOLDOWN_SECONDS', 600);
+                    $coolKey = 'wa:maint:last:' . ($num ?: 'unknown');
+                    if ($cooldown > 0 && \Illuminate\Support\Facades\Cache::get($coolKey)) {
+                        return response()->json(['ok' => true, 'maintenance' => true, 'skipped_by_cooldown' => true]);
+                    }
+
+                    $msg = $this->buildMaintenanceMessage('whatsapp');
+                    if (is_string($msg) && trim($msg) !== '' && $phone !== '') {
+                        $this->sender->sendText($phone, $msg);
+                        if ($cooldown > 0) {
+                            \Illuminate\Support\Facades\Cache::put($coolKey, 1, $cooldown);
+                        }
+                    }
+                    return response()->json(['ok' => true, 'maintenance' => true]);
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Maintenance gate (whatsapp) failed', ['error' => $e->getMessage()]);
+        }
+
         // Novas flags de controle (Proposta A)
         $allowSelf = (bool) env('WA_INBOUND_ALLOW_SELF', false);
         $allowOthers = (bool) env('WA_INBOUND_ALLOW_OTHERS', true);
@@ -472,5 +508,70 @@ class WhatsAppWebhookController extends Controller
         }
 
         return [null, null];
+    }
+
+    // ============================
+    // Maintenance helpers (WhatsApp)
+    // ============================
+    private function envBool(string $key, bool $default = false): bool
+    {
+        $val = env($key);
+        if ($val === null) return $default;
+        $str = strtolower(trim((string) $val));
+        return in_array($str, ['1', 'true', 'on', 'yes'], true);
+    }
+
+    private function isMaintenanceOnForChannel(string $channel): bool
+    {
+        if (!$this->envBool('MAINTENANCE_ON', false)) {
+            return false;
+        }
+        $channelsStr = strtolower((string) env('MAINTENANCE_CHANNELS', 'all'));
+        $channels = array_values(array_filter(array_map('trim', explode(',', $channelsStr))));
+        if (empty($channels) || in_array('all', $channels, true)) {
+            return true;
+        }
+        return in_array(strtolower($channel), $channels, true);
+    }
+
+    private function buildMaintenanceMessage(string $channel): string
+    {
+        $tz = (string) (env('MAINTENANCE_TZ', config('app.timezone') ?: 'UTC'));
+        $greet = $this->makeGreeting($tz);
+        $variant = strtolower((string) env('MAINTENANCE_VARIANT', 'default'));
+        $until = trim((string) env('MAINTENANCE_UNTIL', ''));
+        $statusUrl = trim((string) env('MAINTENANCE_STATUS_URL', ''));
+
+        switch ($variant) {
+            case 'planned':
+                $msg = "Olá, {$greet}! Estamos em manutenção programada";
+                if ($until !== '') {
+                    $msg .= " até {$until}";
+                }
+                $msg .= ". Assim que normalizar, você poderá solicitar novamente. Obrigado pela compreensão.";
+                return $msg;
+            case 'incident':
+                $base = "Olá, {$greet}! Identificamos uma instabilidade e estamos trabalhando na correção. Tente novamente em alguns minutos. Agradecemos a paciência.";
+                if ($statusUrl !== '') {
+                    $base .= "\n" . $statusUrl;
+                }
+                return $base;
+            case 'degraded':
+                return "Olá, {$greet}! Estamos com instabilidade. Algumas consultas podem não funcionar agora. Por favor, tente mais tarde.";
+            default:
+                return "Olá, {$greet}! No momento não é possível processar sua solicitação devido a manutenções no sistema. Por favor, tente mais tarde. Obrigado.";
+        }
+    }
+
+    private function makeGreeting(string $tz): string
+    {
+        try {
+            $h = (int) now($tz)->format('G'); // 0-23
+        } catch (\Throwable $e) {
+            $h = (int) now()->format('G');
+        }
+        if ($h >= 18 || $h < 5) return 'boa noite';
+        if ($h <= 11) return 'bom dia';
+        return 'boa tarde';
     }
 }

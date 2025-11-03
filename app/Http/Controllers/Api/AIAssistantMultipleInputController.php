@@ -65,6 +65,24 @@ class AIAssistantMultipleInputController extends Controller
 
     public function chat(Request $request)
     {
+        // Maintenance gate (early): returns short message and skips AI/tools
+        try {
+            if ($this->isMaintenanceOnForChannel('web')) {
+                $tz = (string) (env('MAINTENANCE_TZ', config('app.timezone') ?: 'UTC'));
+                $text = $this->buildMaintenanceMessage('web', $tz);
+                $resp = [
+                    'text' => $text,
+                    'maintenance' => true,
+                    'variant' => strtolower((string) env('MAINTENANCE_VARIANT', 'default')),
+                    'until' => trim((string) env('MAINTENANCE_UNTIL', '')) ?: null,
+                    'status_url' => trim((string) env('MAINTENANCE_STATUS_URL', '')) ?: null,
+                ];
+                return response()->json($resp);
+            }
+        } catch (\Throwable $e) {
+            // If maintenance helpers fail, log and continue normal flow
+            Log::warning('Maintenance gate (web) failed', ['error' => $e->getMessage()]);
+        }
         // Diagnóstico de entrada do /api/chat
         Log::info('Chat entry files', [
             'accept' => $request->header('accept'),
@@ -198,6 +216,70 @@ class AIAssistantMultipleInputController extends Controller
             Log::error('Generic error:', ['error' => $e->getMessage()]);
             return response()->json(['error' => 'Erro interno do servidor'], 500);
         }
+    }
+
+    // ============================
+    // Helper modo manuntenção (Web)
+    // ============================
+    private function envBool(string $key, bool $default = false): bool
+    {
+        $val = env($key);
+        if ($val === null) return $default;
+        $str = strtolower(trim((string) $val));
+        return in_array($str, ['1', 'true', 'on', 'yes'], true);
+    }
+
+    private function isMaintenanceOnForChannel(string $channel): bool
+    {
+        if (!$this->envBool('MAINTENANCE_ON', false)) {
+            return false;
+        }
+        $channelsStr = strtolower((string) env('MAINTENANCE_CHANNELS', 'all'));
+        $channels = array_values(array_filter(array_map('trim', explode(',', $channelsStr))));
+        if (empty($channels) || in_array('all', $channels, true)) {
+            return true;
+        }
+        return in_array(strtolower($channel), $channels, true);
+    }
+
+    private function buildMaintenanceMessage(string $channel, string $tz): string
+    {
+        $greet = $this->makeGreeting($tz);
+        $variant = strtolower((string) env('MAINTENANCE_VARIANT', 'default'));
+        $until = trim((string) env('MAINTENANCE_UNTIL', ''));
+        $statusUrl = trim((string) env('MAINTENANCE_STATUS_URL', ''));
+
+        switch ($variant) {
+            case 'planned':
+                $msg = "Olá, {$greet}! Estamos em manutenção programada";
+                if ($until !== '') {
+                    $msg .= " até {$until}";
+                }
+                $msg .= ". Assim que normalizar, você poderá solicitar novamente. Obrigado pela compreensão.";
+                return $msg;
+            case 'incident':
+                $base = "Olá, {$greet}! Identificamos uma instabilidade e estamos trabalhando na correção. Tente novamente em alguns minutos. Agradecemos a paciência.";
+                if ($statusUrl !== '') {
+                    $base .= "\n" . $statusUrl;
+                }
+                return $base;
+            case 'degraded':
+                return "Olá, {$greet}! Estamos com instabilidade. Algumas consultas podem não funcionar agora. Por favor, tente mais tarde.";
+            default:
+                return "Olá, {$greet}! No momento não é possível processar sua solicitação devido a manutenções no sistema. Por favor, tente mais tarde. Obrigado.";
+        }
+    }
+
+    private function makeGreeting(string $tz): string
+    {
+        try {
+            $h = (int) now($tz)->format('G');
+        } catch (\Throwable $e) {
+            $h = (int) now()->format('G');
+        }
+        if ($h >= 18 || $h < 5) return 'boa noite';
+        if ($h <= 11) return 'bom dia';
+        return 'boa tarde';
     }
 
     /**
