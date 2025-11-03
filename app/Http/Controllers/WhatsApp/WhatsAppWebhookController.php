@@ -53,7 +53,7 @@ class WhatsAppWebhookController extends Controller
             'audioMime' => data_get($webhook, 'data.message.audioMessage.mimetype'),
         ];
         Log::info('Evolution webhook recebido', $meta);
-        Log::info('weebhook',[$webhook]);
+        //Log::info('weebhook',[$webhook]);
         $normalized = $this->normalizer->normalize($webhook);
 
         Log::info('Normalized summary', [
