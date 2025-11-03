@@ -6,7 +6,9 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Api\BilletController;
 use App\Http\Controllers\Api\AIAssistantController;
 use App\Http\Controllers\Api\ConversationController;
+use App\Http\Controllers\Api\TtsAudioController;
 use App\Http\Controllers\Api\AIAssistantMultipleInputController;
+use App\Http\Controllers\WhatsApp\WhatsAppWebhookController;
 
 //Route::get('/user', function (Request $request) {
 //    return $request->user();
@@ -57,4 +59,11 @@ use App\Http\Controllers\Api\AIAssistantMultipleInputController;
             'port' => env('NF_REDISASSISTENTE_PORT'),
         ];
     });
+    
+    // Webhook da Evolution API (WhatsApp)
+    Route::post('/webhooks/evolution', [WhatsAppWebhookController::class, 'incoming'])
+        ->name('webhooks.evolution');
+
+    Route::get('/audio/tts/{token}', [TtsAudioController::class, 'stream'])
+        ->name('audio.tts.stream');
 //});

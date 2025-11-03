@@ -372,7 +372,7 @@ class CardTool extends Tool
         $cpf = Cache::get($cacheKey);
 
         if ($cpf) {
-            Cache::put($cacheKey, $cpf, 3600);
+            Cache::forever($cacheKey, $cpf);
         }
 
         return $cpf ?: null;
@@ -384,6 +384,6 @@ class CardTool extends Tool
             return;
         }
 
-        Cache::put("conv:{$this->conversationId}:last_cpf", $cpf, 3600);
+        Cache::forever("conv:{$this->conversationId}:last_cpf", $cpf);
     }
 }

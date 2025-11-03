@@ -38,6 +38,21 @@ class RedisConversationService
         //$this->conversationRedis->expire($key, self::CONVERSATION_TTL);
     }
 
+    public function replaceMessages(string $sessionId, array $messages): void
+    {
+        $key = "messages:{$sessionId}";
+        $this->conversationRedis->del($key);
+
+        $limited = array_slice($messages, -self::MAX_MESSAGES);
+
+        foreach (array_reverse($limited) as $message) {
+            if (!is_array($message)) {
+                continue;
+            }
+            $this->conversationRedis->lpush($key, json_encode($message));
+        }
+    }
+
     /**
      * Recupera o histórico de mensagens
      */
@@ -128,5 +143,10 @@ class RedisConversationService
             'awaiting_data' => $context['awaiting_data'] ?? null,
             'has_client_info' => !empty($context['client_info']),
         ];
+    }
+
+    public function getMaxMessages(): int
+    {
+        return self::MAX_MESSAGES;
     }
 }

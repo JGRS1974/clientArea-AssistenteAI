@@ -18,6 +18,7 @@ use App\Services\ConversationService;
 use App\Services\AudioTranscriptionService;
 use App\Services\ImageAnalysisService;
 use App\Services\AssistantMessageBuilder;
+use App\Services\CanonicalConversationService;
 use App\Services\RedisConversationService;
 use Prism\Prism\Exceptions\PrismException;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
@@ -35,6 +36,7 @@ class AIAssistantMultipleInputController extends Controller
     protected $imageAnalysisService;
     protected $redisConversationService;
     protected AssistantMessageBuilder $assistantMessages;
+    protected CanonicalConversationService $canonicalConversations;
     protected array $cardFilterDiagnostics = [];
 
     public function __construct(
@@ -45,6 +47,7 @@ class AIAssistantMultipleInputController extends Controller
         ConversationService $conversationService,
         AudioTranscriptionService $audioTranscriptionService,
         ImageAnalysisService $imageAnalysisService,
+        CanonicalConversationService $canonicalConversations,
         RedisConversationService $redisConversationService,
         AssistantMessageBuilder $assistantMessages
     ) {
@@ -55,12 +58,48 @@ class AIAssistantMultipleInputController extends Controller
         $this->conversationService = $conversationService;
         $this->audioTranscriptionService = $audioTranscriptionService;
         $this->imageAnalysisService = $imageAnalysisService;
+        $this->canonicalConversations = $canonicalConversations;
         $this->redisConversationService = $redisConversationService;
         $this->assistantMessages = $assistantMessages;
     }
 
     public function chat(Request $request)
     {
+        // Diagnóstico de entrada do /api/chat
+        Log::info('Chat entry files', [
+            'accept' => $request->header('accept'),
+            'has_audio' => $request->hasFile('audio'),
+            'audio_mime' => $request->hasFile('audio') ? $request->file('audio')->getClientMimeType() : null,
+            'audio_size' => $request->hasFile('audio') ? $request->file('audio')->getSize() : null,
+            'has_image' => $request->hasFile('image'),
+        ]);
+
+        // Diagnóstico detalhado do arquivo recebido (classe, validade, erros)
+        try {
+            $af = $request->hasFile('audio') ? $request->file('audio') : null;
+            $aiu = null;
+            $apath = null;
+            $avalid = null;
+            $aerr = null;
+            if ($af) {
+                $apath = method_exists($af, 'getPathname') ? $af->getPathname() : null;
+                $avalid = method_exists($af, 'isValid') ? $af->isValid() : null;
+                $aerr = method_exists($af, 'getError') ? $af->getError() : null;
+                if (is_string($apath) && $apath !== '') {
+                    $aiu = function_exists('is_uploaded_file') ? @is_uploaded_file($apath) : null;
+                }
+            }
+            Log::info('Chat file diagnostics', [
+                'audio_class' => $af ? get_class($af) : null,
+                'audio_path' => $apath,
+                'audio_is_valid' => $avalid,
+                'audio_error' => $aerr,
+                'audio_is_uploaded_file' => $aiu,
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('Chat file diagnostics failed', ['error' => $e->getMessage()]);
+        }
+
         $request->validate([
             'text' => 'nullable|string|max:4000',
             'audio' => 'nullable|file|mimes:mp3,wav,m4a,ogg,webm,flac,aac|max:25600', // 25MB
@@ -72,8 +111,15 @@ class AIAssistantMultipleInputController extends Controller
             return response()->json(['error' => 'Deve fornecer texto, áudio ou imagem'], 400);
         }
 
-        $conversationId = $this->conversationIdService->setConversationId($request);
+        $conversationIdOriginal = $this->conversationIdService->setConversationId($request);
+        $conversationId = $this->canonicalConversations->resolveForWeb($conversationIdOriginal) ?? $conversationIdOriginal;
+        if ($conversationId !== $conversationIdOriginal) {
+            $this->canonicalConversations->linkWebToCanonical($conversationIdOriginal, $conversationId);
+        }
         $kw = $request->kw;
+        if (!$kw) {
+            $kw = Cache::get($this->getConversationCacheKey($conversationId, 'kw_value'));
+        }
         //Log::info('kw enviado payload ' . $kw);
         $this->syncKwStatusWithHeader($conversationId, $kw);
         $this->ticketTool->setConversationId($conversationId);
@@ -95,6 +141,31 @@ class AIAssistantMultipleInputController extends Controller
             $detectedCpf = $this->extractCpf($userInput);
             if ($detectedCpf) {
                 $this->storeLastCpf($conversationId, $detectedCpf);
+                $canonical = $this->canonicalConversations->linkWebToCpf($conversationIdOriginal, $detectedCpf);
+                if ($canonical !== $conversationId) {
+                    $conversationId = $canonical;
+                    $this->ticketTool->setConversationId($conversationId);
+                    $this->cardTool->setConversationId($conversationId);
+                    $this->irInformTool->setConversationId($conversationId);
+                }
+            }
+
+            $isLoginConfirmation = $this->looksLikeLoginConfirmation($userInput);
+
+            if (!$isLoginConfirmation) {
+                Cache::put(
+                    $this->getConversationCacheKey($conversationId, 'last_user_text'),
+                    $userInput,
+                    now()->endOfDay()
+                );
+            }
+
+            if ($isLoginConfirmation) {
+                $this->redisConversationService->addMessage($conversationId, 'user', $userInput);
+                $pendingPayload = $this->handlePendingRequest($conversationId, $kw);
+                if ($pendingPayload !== null) {
+                    return response()->json($pendingPayload);
+                }
             }
 
             $detectedIntent = $this->detectIntentFromMessage($userInput);
@@ -209,6 +280,7 @@ class AIAssistantMultipleInputController extends Controller
                 'primaryCardField' => $primaryCardField,
                 'ticketError' => $ticketError,
                 'ticketErrorDetail' => $ticketErrorDetail,
+                'intentNow' => $this->getStoredIntent($conversationId),
             ])->render())
         ];
         //Log::info('PROMPT' , $messages);
@@ -224,14 +296,28 @@ class AIAssistantMultipleInputController extends Controller
             $tools = [];
 
             $isLoggedIn = $statusLogin === 'usuário logado';
+            $intentNow = $this->getStoredIntent($conversationId);
 
-            if ($storedCpf) {
-                $tools[] = $this->ticketTool;
-            }
-
-            if ($storedCpf && $isLoggedIn) {
-                $tools[] = $this->cardTool;
-                $tools[] = $this->irInformTool;
+            // Gateamento de ferramentas por intenção para evitar chamadas indevidas
+            switch ($intentNow) {
+                case 'ticket':
+                    if ($storedCpf) {
+                        $tools[] = $this->ticketTool;
+                    }
+                    break;
+                case 'card':
+                    if ($storedCpf && $isLoggedIn) {
+                        $tools[] = $this->cardTool;
+                    }
+                    break;
+                case 'ir':
+                    if ($storedCpf && $isLoggedIn) {
+                        $tools[] = $this->irInformTool;
+                    }
+                    break;
+                default:
+                    // Sem intenção clara: não expõe tools; o assistente pede clarificação
+                    break;
             }
 
             $response = Prism::text()
@@ -328,6 +414,20 @@ class AIAssistantMultipleInputController extends Controller
         $contractFilters = $payloadRequest['contract_filters'] ?? [];
         $periodFilters = $payloadRequest['period_filters'] ?? [];
 
+        $pendingKey = $this->getConversationCacheKey($conversationId, 'pending_request');
+        if ($shouldShowLogin) {
+            $pending = [
+                'intent' => $intent,
+                'fields' => $requestedFields,
+                'contract_filters' => $contractFilters,
+                'period_filters' => $periodFilters,
+                'user_text' => Cache::get($this->getConversationCacheKey($conversationId, 'last_user_text')),
+            ];
+            Cache::put($pendingKey, $pending, now()->endOfDay());
+        } else {
+            Cache::forget($pendingKey);
+        }
+
         $this->assistantMessages->setConversation($conversationId, $intent);
         $this->cardFilterDiagnostics = [];
 
@@ -350,15 +450,36 @@ class AIAssistantMultipleInputController extends Controller
                 'coparticipacao' => 'coparticipacao',
             ];
 
+            // 1) Carrega os dados crus do cache (antes de esquecer) para decidir o que incluir
+            $rawByField = [];
             foreach ($dataMap as $field => $suffix) {
                 $cacheKey = $this->getConversationCacheKey($conversationId, $suffix);
-                $rawData = $cacheKey ? Cache::get($cacheKey) : null;
+                $rawByField[$field] = $cacheKey ? Cache::get($cacheKey) : null;
+            }
 
+            // 2) Determina os campos a incluir
+            $fieldsToInclude = $requestedFields;
+            if (empty($fieldsToInclude)) {
+                foreach ($dataMap as $field => $_) {
+                    $raw = $rawByField[$field] ?? null;
+                    if (is_array($raw) && !empty($raw)) {
+                        $fieldsToInclude[] = $field;
+                    }
+                }
+                $fieldsToInclude = array_values(array_unique($fieldsToInclude));
+            }
+
+            // 3) Processa cada campo e popula o payload
+            foreach ($dataMap as $field => $suffix) {
+                $cacheKey = $this->getConversationCacheKey($conversationId, $suffix);
+                $rawData = $rawByField[$field] ?? null;
+
+                // Limpa o cache após leitura
                 if ($cacheKey) {
                     Cache::forget($cacheKey);
                 }
 
-                if (!in_array($field, $requestedFields, true)) {
+                if (!in_array($field, $fieldsToInclude, true)) {
                     continue;
                 }
 
@@ -372,9 +493,7 @@ class AIAssistantMultipleInputController extends Controller
                     $data = $this->filterCardDataByPeriod($data, $periodFilters, $field);
                 }
 
-                $data = array_values($data);
-
-                $payload[$field] = $data;
+                $payload[$field] = array_values($data);
             }
 
             $payload['text'] = $this->adjustCardText(
@@ -559,17 +678,35 @@ class AIAssistantMultipleInputController extends Controller
             'fantasia' => [],
             'id' => [],
             'numerocontrato' => [],
+            'situacao' => [],
         ];
 
         $filters['plan'] = $this->filterPlanStopwords(
             $this->extractTermsByKeywords($message, ['plano', 'planos'])
         );
-        $filters['entidade'] = $this->extractTermsByKeywords($message, ['entidade', 'entidades']);
-        $filters['operadora'] = $this->extractTermsByKeywords($message, ['operadora', 'operadoras']);
-        $filters['fantasia'] = $this->extractTermsByKeywords($message, ['fantasia', 'nome fantasia', 'operadora fantasia']);
+        $filters['entidade'] = $this->filterPlanStopwords(
+            $this->extractTermsByKeywords($message, ['entidade', 'entidades'])
+        );
+        $filters['operadora'] = $this->filterPlanStopwords(
+            $this->extractTermsByKeywords($message, ['operadora', 'operadoras'])
+        );
+        $filters['fantasia'] = $this->filterPlanStopwords(
+            $this->extractTermsByKeywords($message, ['fantasia', 'nome fantasia', 'operadora fantasia'])
+        );
 
         $filters['id'] = $this->extractContractIdTerms($message);
         $filters['numerocontrato'] = $this->extractNumeroContratoTerms($message);
+
+        // Detecta intenções de situação (ativo/cancelado) no texto completo
+        $normMsg = $this->normalizeText($message);
+        if ($normMsg !== '') {
+            if (preg_match('/\b(ativo|ativos|vigente|vigentes)\b/u', $normMsg)) {
+                $filters['situacao'][] = 'ativo';
+            }
+            if (preg_match('/\b(cancelad[oa]s?|inativ[oa]s?)\b/u', $normMsg)) {
+                $filters['situacao'][] = 'cancelado';
+            }
+        }
 
         foreach ($filters as $key => $list) {
             $normalized = [];
@@ -587,7 +724,7 @@ class AIAssistantMultipleInputController extends Controller
 
     private function hasMeaningfulContractFilters(array $filters): bool
     {
-        foreach (['plan', 'entidade', 'operadora', 'fantasia', 'id', 'numerocontrato'] as $key) {
+        foreach (['plan', 'entidade', 'operadora', 'fantasia', 'id', 'numerocontrato', 'situacao'] as $key) {
             $values = $filters[$key] ?? [];
 
             if (empty($values)) {
@@ -623,7 +760,12 @@ class AIAssistantMultipleInputController extends Controller
         $stopwords = [
             'atual', 'atuais', 'vigente', 'vigentes', 'novo', 'novos', 'antigo', 'antigos',
             'meu', 'minha', 'seu', 'sua', 'plano', 'planos', 'contrato', 'contratos', 'um', 'o',
-            'este', 'esse', 'essa', 'isso', 'aquele', 'aquela', 'principal', 'ativo', 'ativos'
+            'este', 'esse', 'essa', 'isso', 'aquele', 'aquela', 'principal', 'ativo', 'ativos',
+            // cortesia / agradecimentos (e variações comuns)
+            'por favor', 'porfavor', 'favor', 'por gentileza', 'gentileza',
+            'obrigado', 'obrigada', 'obg', 'obgd', 'valeu',
+            'pf', 'pfv', 'pfvr', 'pff', 'pls', 'plz', 'porfa', 'please',
+            'agradeco', 'agradeça', 'agradeca', 'agradeceria',
         ];
 
         $filtered = [];
@@ -632,6 +774,11 @@ class AIAssistantMultipleInputController extends Controller
             $normalized = $this->normalizeText($term);
 
             if ($normalized === '' || in_array($normalized, $stopwords, true)) {
+                continue;
+            }
+
+            // Evita termos muito curtos que tendem a ser ruído
+            if (mb_strlen($normalized, 'UTF-8') < 2) {
                 continue;
             }
 
@@ -667,6 +814,13 @@ class AIAssistantMultipleInputController extends Controller
 
         if ($segment === '') {
             return [];
+        }
+
+        // Remove qualquer trecho após marcadores de cortesia (para não vir "por favor" como termo)
+        $breaker = '/\b(por\s*favor|porfavor|por\s+gentileza|obrigad(?:o|a)|obg|obgd|valeu|pfv|pfvr|pf|pff|pls|plz|porfa|please|agradec(?:o|a|eria)|agradeceria)\b/iu';
+        $preBreak = preg_split($breaker, $segment);
+        if (is_array($preBreak) && count($preBreak) > 0) {
+            $segment = trim((string) $preBreak[0]);
         }
 
         $segment = str_replace(['/', ';', '|'], ',', $segment);
@@ -807,6 +961,7 @@ class AIAssistantMultipleInputController extends Controller
             'fantasia' => [],
             'id' => [],
             'numerocontrato' => [],
+            'situacao' => [],
         ];
 
         if (!is_array($filters)) {
@@ -1013,6 +1168,7 @@ class AIAssistantMultipleInputController extends Controller
         $normalizedNumeroContrato = $this->normalizeText(
             isset($contract['numerocontrato']) ? (string) $contract['numerocontrato'] : ''
         );
+        $normalizedSituacao = $this->normalizeText($contract['situacao'] ?? '');
 
         $hasAnyFilter = false;
 
@@ -1035,6 +1191,11 @@ class AIAssistantMultipleInputController extends Controller
                             return true;
                         }
                         if ($normalizedFantasia !== '' && str_contains($normalizedFantasia, $value)) {
+                            return true;
+                        }
+                        break;
+                    case 'situacao':
+                        if ($normalizedSituacao !== '' && str_contains($normalizedSituacao, $value)) {
                             return true;
                         }
                         break;
@@ -1516,7 +1677,7 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         $cacheKey = $this->getConversationCacheKey($conversationId, 'last_cpf');
-        Cache::put($cacheKey, $normalized, 3600);
+        Cache::forever($cacheKey, $normalized);
 
         $this->redisConversationService->setMetadataField($conversationId, 'last_cpf', $normalized);
         $this->redisConversationService->setMetadataField($conversationId, 'last_cpf_at', now()->toISOString());
@@ -1528,14 +1689,14 @@ class AIAssistantMultipleInputController extends Controller
         $cpf = Cache::get($cacheKey);
 
         if ($cpf && strlen($cpf) === 11) {
-            Cache::put($cacheKey, $cpf, 3600);
+            Cache::forever($cacheKey, $cpf);
             return $cpf;
         }
 
         $metaCpf = $this->redisConversationService->getMetadataField($conversationId, 'last_cpf');
 
         if ($metaCpf && strlen($metaCpf) === 11) {
-            Cache::put($cacheKey, $metaCpf, 3600);
+            Cache::forever($cacheKey, $metaCpf);
             return $metaCpf;
         }
 
@@ -1556,6 +1717,86 @@ class AIAssistantMultipleInputController extends Controller
             return true;
         }
         return false;
+    }
+
+    private function looksLikeLoginConfirmation(string $text): bool
+    {
+        $normalized = Str::lower(Str::ascii($text));
+
+        $patterns = [
+            'ja fiz login',
+            'já fiz login',
+            'ja fiz o login',
+            'já fiz o login',
+            'fiz login',
+            'login concluido',
+            'login concluído',
+            'já realizei o login',
+            'ja realizei o login',
+            'acabei de fazer login',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (str_contains($normalized, Str::ascii($pattern))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function handlePendingRequest(string $conversationId, ?string $kw): ?array
+    {
+        $pendingKey = $this->getConversationCacheKey($conversationId, 'pending_request');
+        $pending = Cache::pull($pendingKey);
+
+        if (!$pending) {
+            return null;
+        }
+
+        $kw = $kw ?? Cache::get($this->getConversationCacheKey($conversationId, 'kw_value'));
+        $cpf = $this->getStoredCpf($conversationId);
+
+        if (!$kw || !$cpf) {
+            return null;
+        }
+
+        $intent = $pending['intent'] ?? $this->getStoredIntent($conversationId);
+        if (!$intent) {
+            return null;
+        }
+
+        $responseText = null;
+
+        switch ($intent) {
+            case 'card':
+                $this->cardTool->setConversationId($conversationId);
+                $this->cardTool->setKw($kw);
+                $responseText = $this->cardTool->__invoke($cpf, $kw);
+                break;
+            case 'ir':
+                $this->irInformTool->setConversationId($conversationId);
+                $this->irInformTool->setKw($kw);
+                $responseText = $this->irInformTool->__invoke($cpf, null, $kw);
+                break;
+            case 'ticket':
+                $this->ticketTool->setConversationId($conversationId);
+                $responseText = $this->ticketTool->__invoke($cpf);
+                break;
+            default:
+                return null;
+        }
+
+        if ($responseText === null) {
+            return null;
+        }
+
+        $this->redisConversationService->addMessage($conversationId, 'assistant', $responseText);
+
+        $payload = $this->buildResponsePayload($conversationId, $responseText);
+        $payload['login'] = false;
+
+        return $payload;
     }
 
 }

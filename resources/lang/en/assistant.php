@@ -13,8 +13,8 @@ return [
         'required' => [
             'generic' => [
                 'Você precisa estar logado para consultar :label.<br>Faça login e me avise, por favor. 🙂',
-                'Você precisa estar logado para consultar :label.<br>Faça login e me avise, obrigada.',
-                'Para acessar :label, faça login e me avise quando concluir. Obrigada. 🙂',
+                'Você precisa estar logado para consultar :label.<br>Faça login e me avise, obrigado.',
+                'Para acessar :label, faça login e me avise quando concluir. Obrigado. 🙂',
                 'Faça login para liberar :label e me avise ao terminar, por favor. 🙂',
             ],
             'ir' => [

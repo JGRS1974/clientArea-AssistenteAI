@@ -269,7 +269,7 @@ class IrInformTool extends Tool
         $cpf = Cache::get($key);
 
         if ($cpf) {
-            Cache::put($key, $cpf, 3600);
+            Cache::forever($key, $cpf);
         }
 
         return $cpf ?: null;
