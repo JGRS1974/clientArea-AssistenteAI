@@ -69,7 +69,7 @@ class CardTool extends Tool
             Log::warning('CardTool executada sem kw.');
             $this->clearCardData();
             $this->setKwStatus(null);
-            return "Não foi possível consultar a informação da carterinha porque o acesso não foi confirmado.";
+            return "Não foi possível consultar seus dados porque o acesso não foi confirmado.";
         }
 
         $this->clearCardData();
@@ -102,12 +102,31 @@ class CardTool extends Tool
                     !empty($financialInformation) ||
                     !empty($coparticipationInformation)
                 ) {
-                    return "Carteirinha encontrada. Lista pronta para exibição.";
+                    // Mensagem contextual conforme o(s) bloco(s) com dados
+                    $hasBenef = !empty($beneficiariesInformation);
+                    $hasPlans = !empty($contractsInformation);
+                    $hasFinance = !empty($financialInformation);
+                    $hasCopa = !empty($coparticipationInformation);
+
+                    if ($hasPlans && !$hasBenef && !$hasFinance && !$hasCopa) {
+                        return "Planos localizados. Lista pronta para exibição.";
+                    }
+                    if ($hasBenef && !$hasPlans && !$hasFinance && !$hasCopa) {
+                        return "Carteirinha localizada. Lista pronta para exibição.";
+                    }
+                    if ($hasFinance && !$hasBenef && !$hasPlans && !$hasCopa) {
+                        return "Relatório financeiro localizado. Lista pronta para exibição.";
+                    }
+                    if ($hasCopa && !$hasBenef && !$hasPlans && !$hasFinance) {
+                        return "Coparticipação localizada. Lista pronta para exibição.";
+                    }
+
+                    return "Dados localizados. Lista pronta para exibição.";
                 }
             }
 
             $this->storeCardDataExtended([], [], [], []);
-            return "Nenhuma informação da carterinha foi encontrada para o CPF do cliente {$cpf}.";
+            return "Não encontrei dados para este CPF.";
         }
 
         $httpCode = $responseDataClient['httpcode'] ?? null;
@@ -122,12 +141,12 @@ class CardTool extends Tool
         if ($this->isNoPlanFound($httpCode, $errorMessage)) {
             $this->setKwStatus('valid', $kw);
             $this->storeCardDataExtended([], [], [], []);
-            return "Nenhuma informação da carterinha foi encontrada para o CPF do cliente {$cpf}.";
+            return "Não encontrei dados para este CPF.";
         }
 
         $this->setKwStatus(null);
         $this->clearCardData();
-        return "Não foi possível consultar a informação da carterinha para o CPF do cliente {$cpf}, ocorreu um erro técnico.";
+        return "Não foi possível consultar seus dados para este CPF devido a um erro técnico.";
     }
 
     private function formatBeneficiaries(array $planos): array
