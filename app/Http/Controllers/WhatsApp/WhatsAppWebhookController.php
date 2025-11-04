@@ -375,6 +375,8 @@ class WhatsAppWebhookController extends Controller
             // Headers para forçar resposta JSON (evitar 302 de validação)
             'HTTP_ACCEPT' => 'application/json',
             'HTTP_X_REQUESTED_WITH' => 'XMLHttpRequest',
+            // Canal de origem (para o classificador de intenção)
+            'HTTP_X_CHANNEL' => 'whatsapp',
             // Contexto de host/esquema para geração correta de URLs internas
             'HTTP_HOST' => $hostHeader,
             'SERVER_NAME' => $hostOnly,

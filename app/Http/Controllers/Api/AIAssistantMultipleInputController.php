@@ -21,6 +21,7 @@ use App\Services\ImageAnalysisService;
 use App\Services\AssistantMessageBuilder;
 use App\Services\CanonicalConversationService;
 use App\Services\RedisConversationService;
+use App\Services\IntentClassifierService;
 use Prism\Prism\Exceptions\PrismException;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\Messages\SystemMessage;
@@ -39,6 +40,7 @@ class AIAssistantMultipleInputController extends Controller
     protected AssistantMessageBuilder $assistantMessages;
     protected CanonicalConversationService $canonicalConversations;
     protected array $cardFilterDiagnostics = [];
+    protected IntentClassifierService $intentClassifier;
 
     public function __construct(
         TicketTool $ticketTool,
@@ -50,7 +52,8 @@ class AIAssistantMultipleInputController extends Controller
         ImageAnalysisService $imageAnalysisService,
         CanonicalConversationService $canonicalConversations,
         RedisConversationService $redisConversationService,
-        AssistantMessageBuilder $assistantMessages
+        AssistantMessageBuilder $assistantMessages,
+        IntentClassifierService $intentClassifier
     ) {
         $this->ticketTool = $ticketTool;
         $this->cardTool = $cardTool;
@@ -62,6 +65,7 @@ class AIAssistantMultipleInputController extends Controller
         $this->canonicalConversations = $canonicalConversations;
         $this->redisConversationService = $redisConversationService;
         $this->assistantMessages = $assistantMessages;
+        $this->intentClassifier = $intentClassifier;
     }
 
     public function chat(Request $request)
@@ -166,6 +170,8 @@ class AIAssistantMultipleInputController extends Controller
                     $this->ticketTool->setConversationId($conversationId);
                     $this->cardTool->setConversationId($conversationId);
                     $this->irInformTool->setConversationId($conversationId);
+                    // Re-sincroniza KW imediatamente no ID canônico para evitar pedido de login no mesmo request
+                    $this->syncKwStatusWithHeader($conversationId, $kw);
                 }
             }
 
@@ -187,9 +193,29 @@ class AIAssistantMultipleInputController extends Controller
                 }
             }
 
-            $detectedIntent = $this->detectIntentFromMessage($userInput);
-            if ($detectedIntent) {
-                $this->storeIntent($conversationId, $detectedIntent);
+            // Classificação de intenção pelo sub-agente
+            $channel = $request->header('X-Channel', 'web');
+            // Histórico curto (antes de registrar a nova mensagem)
+            $history = $this->redisConversationService->getMessages($conversationId);
+            $classification = $this->intentClassifier->classify($userInput, $history, $channel);
+            $intentProposed = $classification['intent'] ?? 'unknown';
+            $intentConfidence = (float) ($classification['confidence'] ?? 0.0);
+            $commitThreshold = (float) env('INTENT_COMMIT_THRESHOLD', 0.7);
+
+            // Observabilidade
+            Log::info('Intent.classified', [
+                'conv' => $conversationId,
+                'channel' => $channel,
+                'intent' => $intentProposed,
+                'confidence' => $intentConfidence,
+                'threshold' => $commitThreshold,
+            ]);
+            $this->redisConversationService->setMetadataField($conversationId, 'intent_proposed', $intentProposed);
+            $this->redisConversationService->setMetadataField($conversationId, 'intent_confidence', $intentConfidence);
+
+            // Persistência condicional
+            if ($intentProposed !== 'unknown' && $intentConfidence >= $commitThreshold) {
+                $this->storeIntent($conversationId, $intentProposed);
             }
 
             $payloadRequest = $this->detectPayloadRequestFromMessage($userInput);
@@ -199,8 +225,47 @@ class AIAssistantMultipleInputController extends Controller
             //$this->conversationService->addMessage($conversationId, 'user', $userInput);
             $this->redisConversationService->addMessage($conversationId,'user', $userInput);
 
-            // Gera resposta da AI
-            $response = $this->generateAIResponse($conversationId, $kw);
+            // Seleção de ferramentas com base na intenção do turno
+            $intentForTurn = $intentProposed; // usa a intenção proposta neste turno
+
+            $storedCpf = $this->getStoredCpf($conversationId);
+            $kwStatusKey = $this->getConversationCacheKey($conversationId, 'kw_status');
+            $kwStatus = Cache::get($kwStatusKey);
+            $statusLogin = $this->resolveStatusLogin($kw, $kwStatus);
+
+            $tools = [];
+            $isLoggedIn = $statusLogin === 'usuário logado';
+            switch ($intentForTurn) {
+                case 'ticket':
+                    if ($storedCpf) {
+                        $tools[] = $this->ticketTool;
+                    }
+                    break;
+                case 'card':
+                    if ($storedCpf && $isLoggedIn) {
+                        $tools[] = $this->cardTool;
+                    }
+                    break;
+                case 'ir':
+                    if ($storedCpf && $isLoggedIn) {
+                        $tools[] = $this->irInformTool;
+                    }
+                    break;
+                default:
+                    // unknown: não expõe tools
+                    break;
+            }
+
+            Log::info('Tools.gating', [
+                'conv' => $conversationId,
+                'intent' => $intentForTurn,
+                'has_cpf' => (bool) $storedCpf,
+                'is_logged_in' => $isLoggedIn,
+                'tools' => array_map(fn($t) => is_object($t) ? get_class($t) : (string) $t, $tools),
+            ]);
+
+            // Gera resposta da AI (com tools já decididas)
+            $response = $this->generateAIResponse($conversationId, $kw, $tools, $intentForTurn);
             //ds(['Response AI' => $response]);
             // Adiciona resposta da AI à conversa
             //$this->conversationService->addMessage($conversationId, 'assistant', $response);
@@ -213,17 +278,57 @@ class AIAssistantMultipleInputController extends Controller
                     $storedCpf = $this->getStoredCpf($conversationId);
                     $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
                     $lastTool = Cache::get($lastToolKey);
+                    Log::info('Ticket.fallback.check', [
+                        'conv' => $conversationId,
+                        'has_cpf' => (bool) $storedCpf,
+                        'last_tool' => $lastTool,
+                    ]);
                     if ($storedCpf && strlen($storedCpf) === 11 && $lastTool !== 'ticket') {
                         $this->ticketTool->setConversationId($conversationId);
                         // Executa a tool para popular conv:{id}:boletos e last_tool='ticket'
                         $this->ticketTool->__invoke($storedCpf);
+                        Log::info('Ticket.fallback.invoked', ['conv' => $conversationId]);
+                    }
+                } elseif ($currentIntent === 'card') {
+                    $storedCpf = $this->getStoredCpf($conversationId);
+                    $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
+                    $lastTool = Cache::get($lastToolKey);
+                    $loginOk = !$this->shouldShowLoginButton($conversationId, $kw);
+                    Log::info('Card.fallback.check', [
+                        'conv' => $conversationId,
+                        'has_cpf' => (bool) $storedCpf,
+                        'login_ok' => $loginOk,
+                        'last_tool' => $lastTool,
+                    ]);
+                    if ($storedCpf && strlen($storedCpf) === 11 && $loginOk && $lastTool !== 'card') {
+                        $this->cardTool->setConversationId($conversationId);
+                        $this->cardTool->setKw($kw);
+                        $this->cardTool->__invoke($storedCpf, $kw);
+                        Log::info('Card.fallback.invoked', ['conv' => $conversationId]);
+                    }
+                } elseif ($currentIntent === 'ir') {
+                    $storedCpf = $this->getStoredCpf($conversationId);
+                    $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
+                    $lastTool = Cache::get($lastToolKey);
+                    $loginOk = !$this->shouldShowLoginButton($conversationId, $kw);
+                    Log::info('Ir.fallback.check', [
+                        'conv' => $conversationId,
+                        'has_cpf' => (bool) $storedCpf,
+                        'login_ok' => $loginOk,
+                        'last_tool' => $lastTool,
+                    ]);
+                    if ($storedCpf && strlen($storedCpf) === 11 && $loginOk && $lastTool !== 'ir') {
+                        $this->irInformTool->setConversationId($conversationId);
+                        $this->irInformTool->setKw($kw);
+                        $this->irInformTool->__invoke($storedCpf, null, $kw);
+                        Log::info('Ir.fallback.invoked', ['conv' => $conversationId]);
                     }
                 }
             } catch (\Throwable $e) {
                 Log::warning('Ticket fallback execution failed', ['error' => $e->getMessage()]);
             }
 
-            $payload = $this->buildResponsePayload($conversationId, $response);
+            $payload = $this->buildResponsePayload($conversationId, $response, $kw);
 
             return response()->json($payload);
 
@@ -340,7 +445,7 @@ class AIAssistantMultipleInputController extends Controller
     /**
      * Gera resposta da AI usando Prism
      */
-    private function generateAIResponse(string $conversationId, ?string $kw)
+    private function generateAIResponse(string $conversationId, ?string $kw, array $tools, ?string $intentForTurn)
     {
         // Obtém mensagens da conversa
         //$conversationMessages = $this->conversationService->getMessages($conversationId);
@@ -380,7 +485,7 @@ class AIAssistantMultipleInputController extends Controller
                 'primaryCardField' => $primaryCardField,
                 'ticketError' => $ticketError,
                 'ticketErrorDetail' => $ticketErrorDetail,
-                'intentNow' => $this->getStoredIntent($conversationId),
+                'intentNow' => $intentForTurn ?? $this->getStoredIntent($conversationId),
             ])->render())
         ];
         //Log::info('PROMPT' , $messages);
@@ -393,33 +498,13 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         try{
-            $tools = [];
-
-            $isLoggedIn = $statusLogin === 'usuário logado';
-            $intentNow = $this->getStoredIntent($conversationId);
-
-            // Gateamento de ferramentas por intenção para evitar chamadas indevidas
-            switch ($intentNow) {
-                case 'ticket':
-                    if ($storedCpf) {
-                        $tools[] = $this->ticketTool;
-                    }
-                    break;
-                case 'card':
-                    if ($storedCpf && $isLoggedIn) {
-                        $tools[] = $this->cardTool;
-                    }
-                    break;
-                case 'ir':
-                    if ($storedCpf && $isLoggedIn) {
-                        $tools[] = $this->irInformTool;
-                    }
-                    break;
-                default:
-                    // Sem intenção clara: não expõe tools; o assistente pede clarificação
-                    break;
-            }
-
+            Log::info('Prism.start', [
+                'conv' => $conversationId,
+                'intent_in_prompt' => $intentForTurn,
+                'kw_status' => $kwStatus,
+                'has_cpf' => (bool) $storedCpf,
+                'tools_count' => count($tools),
+            ]);
             $response = Prism::text()
                 ->using(Provider::OpenAI, 'gpt-4.1')
                 ->withMessages($messages)
@@ -432,7 +517,11 @@ class AIAssistantMultipleInputController extends Controller
                     'presence_penalty' => 0.2,
                 ])
                 ->asText();
-
+            Log::info('Prism.reply', [
+                'conv' => $conversationId,
+                'tools_count' => count($tools),
+                'preview' => is_string($response->text ?? null) ? mb_substr($response->text, 0, 160) : null,
+            ]);
             return $response->text;
 
         } catch (PrismException $e) {
@@ -498,7 +587,7 @@ class AIAssistantMultipleInputController extends Controller
         Cache::forget($statusKey);
     }
 
-    private function buildResponsePayload(string $conversationId, ?string $responseText): array
+    private function buildResponsePayload(string $conversationId, ?string $responseText, ?string $kwInline = null): array
     {
         $payload = [
             'text' => $responseText ?? '',
@@ -507,8 +596,15 @@ class AIAssistantMultipleInputController extends Controller
 
         $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
         $lastTool = Cache::get($lastToolKey);
-        $shouldShowLogin = $this->shouldShowLoginButton($conversationId);
+        $shouldShowLogin = $this->shouldShowLoginButton($conversationId, $kwInline);
         $intent = $this->getStoredIntent($conversationId);
+        Log::info('Payload.build.start', [
+            'conv' => $conversationId,
+            'intent' => $intent,
+            'last_tool' => $lastTool,
+            'login_required' => $shouldShowLogin,
+            'has_cpf' => (bool) $this->getStoredCpf($conversationId),
+        ]);
         $payloadRequest = $this->getStoredPayloadRequest($conversationId);
         $requestedFields = array_values(array_unique(array_filter($payloadRequest['fields'] ?? [])));
         $contractFilters = $payloadRequest['contract_filters'] ?? [];
@@ -523,6 +619,15 @@ class AIAssistantMultipleInputController extends Controller
                 'period_filters' => $periodFilters,
                 'user_text' => Cache::get($this->getConversationCacheKey($conversationId, 'last_user_text')),
             ];
+            // Se a intenção persistida estiver nula, tenta a proposta do classificador (com confiança suficiente)
+            if (!$pending['intent']) {
+                $proposed = $this->redisConversationService->getMetadataField($conversationId, 'intent_proposed');
+                $confidence = (float) ($this->redisConversationService->getMetadataField($conversationId, 'intent_confidence') ?? 0.0);
+                $threshold = (float) env('INTENT_COMMIT_THRESHOLD', 0.7);
+                if (is_string($proposed) && $proposed !== '' && $confidence >= $threshold) {
+                    $pending['intent'] = $proposed;
+                }
+            }
             Cache::put($pendingKey, $pending, now()->endOfDay());
         } else {
             Cache::forget($pendingKey);
@@ -618,26 +723,68 @@ class AIAssistantMultipleInputController extends Controller
                     'quantidade' => $lista['quantidade'] ?? 0,
                     'documentos' => $lista['documentos'] ?? [],
                 ];
+                // Adiciona follow-up amigável após execução bem-sucedida da tool de IR
+                $original = $payload['text'] ?? '';
+                $sanitized = $this->stripFollowUp($original);
+                $payload['text'] = $this->assistantMessages->withFollowUp($sanitized);
             }
         } else {
-            $messagesForHeuristic = $this->redisConversationService->getMessages($conversationId);
-
-            if ($intent === 'card') {
-            $payload['login'] = $shouldShowLogin;
-
-            if ($shouldShowLogin) {
-                $text = $payload['text'] ?? '';
-
-                if (
-                    $this->messageContradictsLogin($text) ||
-                    !$this->messageMentionsLogin($text) ||
-                    $this->messageAsksForCpf($text)
-                ) {
-                    $payload['text'] = $this->buildLoginReminderMessage($conversationId, $requestedFields);
+            // Reforço determinístico: para intenção 'ticket' sem CPF e sem execução da tool, peça CPF e não afirme "localizei".
+            if ($intent === 'ticket') {
+                $storedCpfNow = $this->getStoredCpf($conversationId);
+                if (!$storedCpfNow) {
+                    $payload['cpf_required'] = true;
+                    // Decide saudação apenas se este for de fato o primeiro turno do assistente
+                    $msgs = $this->redisConversationService->getMessages($conversationId);
+                    $assistantTurns = 0;
+                    foreach ($msgs as $m) {
+                        if (($m['role'] ?? null) === 'assistant') {
+                            $type = $m['metadata']['type'] ?? null;
+                            if (!$type || !in_array($type, ['assistant_error', 'image_response'], true)) {
+                                $assistantTurns++;
+                            }
+                        }
+                    }
+                    $tz = (string) (env('MAINTENANCE_TZ', config('app.timezone') ?: 'UTC'));
+                    $greet = $this->makeGreeting($tz);
+                    $base = 'Para consultar seus boletos, preciso do seu CPF (somente números), por favor.';
+                    $payload['text'] = ($assistantTurns <= 1 ? ('Olá, ' . $greet . '! ') : '') . $base;
+                    Log::info('Payload.ticket.enforce_cpf', ['conv' => $conversationId, 'assistant_turns' => $assistantTurns]);
                 }
             }
-        } elseif ($intent === 'ir' || ($intent === null && $this->looksLikeIrRequest($messagesForHeuristic))) {
-            $payload['login'] = $shouldShowLogin;
+
+            $messagesForHeuristic = $this->redisConversationService->getMessages($conversationId);
+            $assistantCount = 0;
+            foreach ($messagesForHeuristic as $m) {
+                if (($m['role'] ?? null) === 'assistant') {
+                    $type = $m['metadata']['type'] ?? null;
+                    if (!$type || !in_array($type, ['assistant_error', 'image_response'], true)) {
+                        $assistantCount++;
+                    }
+                }
+            }
+
+            if ($intent === 'card') {
+                $payload['login'] = $shouldShowLogin;
+
+                if ($shouldShowLogin) {
+                    $text = $payload['text'] ?? '';
+
+                    if (
+                        $this->messageContradictsLogin($text) ||
+                        !$this->messageMentionsLogin($text) ||
+                        $this->messageAsksForCpf($text)
+                    ) {
+                        $payload['text'] = $this->buildLoginReminderMessage($conversationId, $requestedFields);
+                    } else {
+                        if ($assistantCount > 0) {
+                            $payload['text'] = $this->stripGreeting($payload['text'] ?? '');
+                            $payload['text'] = $this->stripFollowUp($payload['text'] ?? '');
+                        }
+                    }
+                }
+            } elseif ($intent === 'ir') {
+                $payload['login'] = $shouldShowLogin;
 
                 if (
                     $shouldShowLogin && (
@@ -647,6 +794,11 @@ class AIAssistantMultipleInputController extends Controller
                     )
                 ) {
                     $payload['text'] = $this->buildIrLoginReminderMessage();
+                } elseif ($shouldShowLogin) {
+                    if ($assistantCount > 0) {
+                        $payload['text'] = $this->stripGreeting($payload['text'] ?? '');
+                        $payload['text'] = $this->stripFollowUp($payload['text'] ?? '');
+                    }
                 }
             }
         }
@@ -686,16 +838,16 @@ class AIAssistantMultipleInputController extends Controller
         Cache::forget($this->getConversationCacheKey($conversationId, 'ticket_error'));
         Cache::forget($this->getConversationCacheKey($conversationId, 'ticket_error_detail'));
 
-        return $this->enforceCpfRequirement($payload, $conversationId, $intent, $requestedFields);
+        return $this->enforceCpfRequirement($payload, $conversationId, $intent, $requestedFields, $kwInline);
     }
 
-    private function enforceCpfRequirement(array $payload, string $conversationId, ?string $intent, array $requestedFields): array
+    private function enforceCpfRequirement(array $payload, string $conversationId, ?string $intent, array $requestedFields, ?string $kwInline = null): array
     {
         if ($intent !== 'card') {
             return $payload;
         }
 
-        if ($this->shouldShowLoginButton($conversationId)) {
+        if ($this->shouldShowLoginButton($conversationId, $kwInline)) {
             return $payload;
         }
 
@@ -707,56 +859,20 @@ class AIAssistantMultipleInputController extends Controller
 
         $payload['cpf_required'] = true;
 
-        $text = $payload['text'] ?? '';
-
-        if (!$this->messageAsksForCpf($text)) {
-            $primaryField = $this->determinePrimaryCardField($requestedFields);
-            $payload['text'] = $this->assistantMessages->requestCpfForField($primaryField);
-        }
+        // Não solicitar CPF explicitamente por texto após login;
+        // O front/fluxo envia a mensagem com CPF automaticamente.
 
         return $payload;
     }
 
-    private function shouldShowLoginButton(string $conversationId): bool
+    private function shouldShowLoginButton(string $conversationId, ?string $kwInline = null): bool
     {
-        $kw = Cache::get($this->getConversationCacheKey($conversationId, 'kw_value'));
+        $kw = $kwInline ?: Cache::get($this->getConversationCacheKey($conversationId, 'kw_value'));
         $kwStatus = Cache::get($this->getConversationCacheKey($conversationId, 'kw_status'));
-
         return $this->resolveStatusLogin($kw, $kwStatus) !== 'usuário logado';
     }
 
-    private function detectIntentFromMessage(string $message): ?string
-    {
-        $normalized = mb_strtolower($message, 'UTF-8');
-
-        if (preg_match('/\b(boleto|segunda via|2a via|fatura|pagamento)\b/u', $normalized)) {
-            return 'ticket';
-        }
-
-        $isIrIntent =
-            preg_match('/\b(informes?\s*(?:de)?\s*rendimentos?)\b/u', $normalized) ||
-            preg_match('/\b(informe\s*ir|ir\s*20\d{2}|irpf)\b/u', $normalized) ||
-            preg_match('/\b(imposto\s*de\s*renda|dirf|comprovante\s*(?:do\s*)?imposto\s*de\s*renda)\b/u', $normalized) ||
-            preg_match('/\b(demonstrat(?:ivo|ivo\s*de)\s*pagament(?:o|os))\b/u', $normalized) ||
-            preg_match('/\b(?:o|seu|meu)\s*ir\b/u', $normalized);
-
-        if ($isIrIntent) {
-            return 'ir';
-        }
-
-        $isCardIntent =
-            preg_match('/carteir|cart[ãa]o virtual|documento digital/u', $normalized) ||
-            preg_match('/\b(planos?|contratos?)\b/u', $normalized) ||
-            preg_match('/relat[óo]rio\s*financeir[oa]|ficha\s*financeir[oa]|(?:meu|minha|seu|sua|o|a)?\s*financeir[oa]\b|\bfinanceir[oa]\b/u', $normalized) ||
-            preg_match('/co[-\s]?participa[cç][aã]o/u', $normalized) ||
-            $this->matchesPaymentsRequest($normalized);
-
-        if ($isCardIntent) {
-            return 'card';
-        }
-
-        return null;
-    }
+    
 
     private function detectPayloadRequestFromMessage(string $message): array
     {
@@ -1529,6 +1645,38 @@ class AIAssistantMultipleInputController extends Controller
         return str_contains($normalized, 'cpf');
     }
 
+    private function stripGreeting(string $text): string
+    {
+        if ($text === '') return $text;
+        // Remove padrões de saudação no início do texto
+        $stripped = preg_replace('/^\s*ol[áa][,!]?\s*(bom\s+dia|boa\s+tarde|boa\s+noite)?[!,.]?\s*/iu', '', $text);
+        return is_string($stripped) ? $stripped : $text;
+    }
+
+    private function stripFollowUp(string $text): string
+    {
+        if ($text === '') return $text;
+        $normalized = Str::lower(Str::ascii(strip_tags($text)));
+        $phrases = [
+            'posso ajudar em mais alguma coisa',
+            'quer apoio com mais algum assunto',
+            'precisa de algo mais',
+            'posso ajudar com outra duvida',
+            'posso ajudar com outra dúvida',
+        ];
+
+        foreach ($phrases as $p) {
+            if (str_contains($normalized, $p)) {
+                // Remove a última frase/linha contendo a expressão
+                $text = preg_replace('/(<br\s*\/?\s*>\s*)?' . preg_quote($p, '/') . '[?.!]*\s*$/iu', '', $text);
+                // Também remove versões sem acentos já normalizadas
+                $text = preg_replace('/(<br\s*\/?\s*>\s*)?posso ajudar em mais alguma coisa[?.!]*\s*$/iu', '', $text);
+            }
+        }
+
+        return trim($text);
+    }
+
     private function buildLoginReminderMessage(string $conversationId, array $requestedFields): string
     {
         $primaryField = $this->determinePrimaryCardField($requestedFields);
@@ -1555,6 +1703,7 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         $patterns = [
+            // Plural
             '/\\bmeus?\\s+pagamentos\\b/u',
             '/\\bseus?\\s+pagamentos\\b/u',
             '/\\bconsult(ar|e|o)\\s+(?:os\\s+)?pagamentos\\b/u',
@@ -1562,10 +1711,10 @@ class AIAssistantMultipleInputController extends Controller
             '/\\bmostre\\s+(?:os\\s+)?pagamentos\\b/u',
             '/\\bver\\s+(?:os\\s+)?pagamentos\\b/u',
             '/\\blistar\\s+(?:os\\s+)?pagamentos\\b/u',
-            '/\\bextrato\\s+(?:de\\s+)?pagamentos\\b/u',
-            '/\\bhist[óo]rico\\s+(?:de\\s+)?pagamentos\\b/u',
-            '/\\bpagamentos\\s+(?:do|da|dos|das)\\b/u',
-            '/\\bpagamentos\\b/u',
+            '/\\bextrato\\s+(?:de\\s+)?pagament(?:o|os)\\b/u',
+            '/\\bhist[óo]rico\\s+(?:de\\s+)?pagament(?:o|os)\\b/u',
+            '/\\bpagament(?:o|os)\\s+(?:do|da|dos|das)\\b/u',
+            '/\\bpagament(?:o|os)\\b/u',
         ];
 
         foreach ($patterns as $pattern) {
@@ -1577,29 +1726,7 @@ class AIAssistantMultipleInputController extends Controller
         return false;
     }
 
-    private function looksLikeIrRequest(array $conversationMessages): bool
-    {
-        for ($i = count($conversationMessages) - 1; $i >= 0; $i--) {
-            $message = $conversationMessages[$i] ?? null;
-
-            if (!is_array($message) || ($message['role'] ?? '') !== 'user') {
-                continue;
-            }
-
-            $text = Str::lower($message['content'] ?? '');
-
-            return (bool) (
-                preg_match('/\b(irpf|imposto\s*de\s*renda|dirf)\b/u', $text) ||
-                preg_match('/\b(informes?\s*(?:de)?\s*rendimentos?)\b/u', $text) ||
-                preg_match('/\b(informe\s*ir|ir\s*20\d{2})\b/u', $text) ||
-                preg_match('/\b(comprovante\s*(?:do\s*)?imposto\s*de\s*renda)\b/u', $text) ||
-                preg_match('/\b(demonstrat(?:ivo|ivo\s*de)\s*pagament(?:o|os))\b/u', $text) ||
-                preg_match('/\b(?:o|seu|meu)\s*ir\b/u', $text)
-            );
-        }
-
-        return false;
-    }
+    
 
     private function isPlansEmpty(array $plans): bool
     {
@@ -1888,6 +2015,7 @@ class AIAssistantMultipleInputController extends Controller
         $pending = Cache::pull($pendingKey);
 
         if (!$pending) {
+            Log::info('Pending.state', ['conv' => $conversationId, 'has_pending' => false]);
             return null;
         }
 
@@ -1895,11 +2023,22 @@ class AIAssistantMultipleInputController extends Controller
         $cpf = $this->getStoredCpf($conversationId);
 
         if (!$kw || !$cpf) {
+            Log::info('Pending.skip_reason', ['conv' => $conversationId, 'kw_present' => (bool) $kw, 'has_cpf' => (bool) $cpf]);
             return null;
         }
 
         $intent = $pending['intent'] ?? $this->getStoredIntent($conversationId);
         if (!$intent) {
+            // Tenta recuperar a intenção proposta (com confiança suficiente)
+            $proposed = $this->redisConversationService->getMetadataField($conversationId, 'intent_proposed');
+            $confidence = (float) ($this->redisConversationService->getMetadataField($conversationId, 'intent_confidence') ?? 0.0);
+            $threshold = (float) env('INTENT_COMMIT_THRESHOLD', 0.7);
+            if (is_string($proposed) && $proposed !== '' && $confidence >= $threshold) {
+                $intent = $proposed;
+            }
+        }
+        if (!$intent) {
+            Log::info('Pending.skip_reason', ['conv' => $conversationId, 'reason' => 'no_intent']);
             return null;
         }
 
@@ -1909,18 +2048,22 @@ class AIAssistantMultipleInputController extends Controller
             case 'card':
                 $this->cardTool->setConversationId($conversationId);
                 $this->cardTool->setKw($kw);
+                Log::info('Pending.run.card', ['conv' => $conversationId]);
                 $responseText = $this->cardTool->__invoke($cpf, $kw);
                 break;
             case 'ir':
                 $this->irInformTool->setConversationId($conversationId);
                 $this->irInformTool->setKw($kw);
+                Log::info('Pending.run.ir', ['conv' => $conversationId]);
                 $responseText = $this->irInformTool->__invoke($cpf, null, $kw);
                 break;
             case 'ticket':
                 $this->ticketTool->setConversationId($conversationId);
+                Log::info('Pending.run.ticket', ['conv' => $conversationId]);
                 $responseText = $this->ticketTool->__invoke($cpf);
                 break;
             default:
+                Log::info('Pending.skip_reason', ['conv' => $conversationId, 'reason' => 'intent_not_supported', 'intent' => $intent]);
                 return null;
         }
 
@@ -1930,7 +2073,7 @@ class AIAssistantMultipleInputController extends Controller
 
         $this->redisConversationService->addMessage($conversationId, 'assistant', $responseText);
 
-        $payload = $this->buildResponsePayload($conversationId, $responseText);
+        $payload = $this->buildResponsePayload($conversationId, $responseText, $kw);
         $payload['login'] = false;
 
         return $payload;
