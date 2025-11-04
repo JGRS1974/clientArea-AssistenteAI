@@ -11,6 +11,7 @@ use Illuminate\Http\Request;
 use Prism\Prism\Enums\Provider;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Lang;
 use Illuminate\Support\Str;
 use App\Http\Controllers\Controller;
 use App\Services\ConversationIdService;
@@ -204,6 +205,23 @@ class AIAssistantMultipleInputController extends Controller
             // Adiciona resposta da AI à conversa
             //$this->conversationService->addMessage($conversationId, 'assistant', $response);
             $this->redisConversationService->addMessage($conversationId,'assistant', $response);
+
+            // Fallback: garantir execução da TicketTool quando intenção for 'ticket' e já houver CPF
+            try {
+                $currentIntent = $this->getStoredIntent($conversationId);
+                if ($currentIntent === 'ticket') {
+                    $storedCpf = $this->getStoredCpf($conversationId);
+                    $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
+                    $lastTool = Cache::get($lastToolKey);
+                    if ($storedCpf && strlen($storedCpf) === 11 && $lastTool !== 'ticket') {
+                        $this->ticketTool->setConversationId($conversationId);
+                        // Executa a tool para popular conv:{id}:boletos e last_tool='ticket'
+                        $this->ticketTool->__invoke($storedCpf);
+                    }
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Ticket fallback execution failed', ['error' => $e->getMessage()]);
+            }
 
             $payload = $this->buildResponsePayload($conversationId, $response);
 
@@ -621,10 +639,47 @@ class AIAssistantMultipleInputController extends Controller
         } elseif ($intent === 'ir' || ($intent === null && $this->looksLikeIrRequest($messagesForHeuristic))) {
             $payload['login'] = $shouldShowLogin;
 
-                if ($shouldShowLogin && $this->messageContradictsLogin($payload['text'] ?? '')) {
+                if (
+                    $shouldShowLogin && (
+                        $this->messageContradictsLogin($payload['text'] ?? '') ||
+                        !$this->messageMentionsLogin($payload['text'] ?? '') ||
+                        $this->messageAsksForCpf($payload['text'] ?? '')
+                    )
+                ) {
                     $payload['text'] = $this->buildIrLoginReminderMessage();
                 }
             }
+        }
+
+        // Deterministic ticket error messaging (optional via env)
+        try {
+            if ($this->envBool('ASSISTANT_TICKET_ERROR_DETERMINISTIC', true)) {
+                $hasTickets = !empty($payload['boletos']);
+                $ticketError = Cache::get($this->getConversationCacheKey($conversationId, 'ticket_error'));
+                $ticketErrorDetail = Cache::get($this->getConversationCacheKey($conversationId, 'ticket_error_detail'));
+
+                if (!$hasTickets && is_string($ticketError) && $ticketError !== '') {
+                    $msg = null;
+                    if ($ticketError === 'cpf_invalid') {
+                        $raw = Lang::get('assistant.ticket.errors.cpf_invalid');
+                        $msg = is_array($raw) ? (string) ($raw[0] ?? '') : (string) $raw;
+                    } elseif ($ticketError === 'pin_invalid') {
+                        $raw = Lang::get('assistant.ticket.errors.validation_failed');
+                        $msg = is_array($raw) ? (string) ($raw[0] ?? '') : (string) $raw;
+                    } elseif ($ticketError === 'technical_error') {
+                        $raw = Lang::get('assistant.ticket.errors.technical');
+                        $msg = is_array($raw) ? (string) ($raw[0] ?? '') : (string) $raw;
+                    } elseif ($ticketError === 'boleto_indisponivel') {
+                        $msg = $this->assistantMessages->ticketExpired();
+                    }
+
+                    if (is_string($msg) && trim($msg) !== '') {
+                        $payload['text'] = $this->assistantMessages->withFollowUp($msg);
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Deterministic ticket error messaging failed', ['error' => $e->getMessage()]);
         }
 
         Cache::forget($lastToolKey);

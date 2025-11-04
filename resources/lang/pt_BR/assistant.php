@@ -18,20 +18,44 @@ return [
                 'Faça login para liberar :label e me avise ao terminar, por favor. 🙂',
             ],
             'ir' => [
-                'Você precisa estar logado para consultar seu informe de rendimentos.<br>Faça login e me avise, por favor. 🙂',
-                'Para liberar o informe de rendimentos, realize o login e me avise. 🙂',
+                'Você precisa estar logado para consultar seu informe de rendimentos.<br>Faça login pelo link e, quando terminar, diga "pronto". 🙂',
+                'Para liberar o informe de rendimentos, realize o login pelo link e me avise respondendo "pronto". 🙂',
+                'Acesse pelo link para liberar o informe de rendimentos e, ao concluir, responda "pronto" para eu continuar. 🙂',
             ],
         ],
     ],
     'ticket' => [
         'none' => [
             'Não encontrei boletos disponíveis no momento.',
+            'Não encontrei boletos em aberto para este CPF.',
+            'Nenhum boleto disponível no momento.',
+            'Não há cobranças em aberto agora. Se preferir, posso conferir outro CPF.',
         ],
         'mixed' => [
             'Encontrei boletos em aberto e outros vencidos. Os indisponíveis mostram o motivo na lista.',
+            'Há boletos em aberto e outros vencidos. Copie a linha digitável dos disponíveis para pagar no app do banco.',
+            'Localizei cobranças: algumas em aberto e outras vencidas. O link dos disponíveis expira em 1 hora.',
+            'Encontrei boletos disponíveis e vencidos; os indisponíveis indicam o motivo na lista.',
         ],
         'expired' => [
             'Não encontrei boletos disponíveis; os registros atuais estão vencidos.',
+            'Constam apenas boletos vencidos. O motivo aparece em cada item da lista.',
+            'Boletos indisponíveis no momento (vencidos). Veja as justificativas na lista.',
+        ],
+        'errors' => [
+            'cpf_invalid' => [
+                'Esse CPF não parece válido. Pode me enviar novamente, só os números (11 dígitos)?',
+                'CPF inválido. Por favor, envie 11 dígitos (somente números).',
+            ],
+            // Validações de segurança/temporárias (substituem menção a "PIN")
+            'validation_failed' => [
+                'Falha na validação da consulta. Posso tentar novamente agora?',
+                'Não consegui validar a consulta desta vez. Refaço a busca para você?',
+            ],
+            'technical' => [
+                'Tive um problema técnico ao consultar seus boletos. Quer que eu tente novamente agora?',
+                'Ocorreu um erro temporário na consulta. Posso refazer a busca?',
+            ],
         ],
     ],
     'card' => [
