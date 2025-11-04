@@ -197,7 +197,18 @@ class AIAssistantMultipleInputController extends Controller
             $channel = $request->header('X-Channel', 'web');
             // Histórico curto (antes de registrar a nova mensagem)
             $history = $this->redisConversationService->getMessages($conversationId);
-            $classification = $this->intentClassifier->classify($userInput, $history, $channel);
+            // Contexto para classificador (apoia mensagens elípticas)
+            $prevIntent = $this->getStoredIntent($conversationId);
+            $lastToolGate = Cache::get($this->getConversationCacheKey($conversationId, 'last_tool'));
+            $lastPayloadReq = $this->getStoredPayloadRequest($conversationId);
+            $lastPrimaryField = Cache::get($this->getConversationCacheKey($conversationId, 'last_card_primary_field'));
+            $clfContext = [
+                'previous_intent' => $prevIntent,
+                'last_tool' => $lastToolGate,
+                'last_card_primary_field' => $lastPrimaryField,
+                'last_requested_fields' => $lastPayloadReq['fields'] ?? [],
+            ];
+            $classification = $this->intentClassifier->classify($userInput, $history, $channel, $clfContext);
             $intentProposed = $classification['intent'] ?? 'unknown';
             $intentConfidence = (float) ($classification['confidence'] ?? 0.0);
             $commitThreshold = (float) env('INTENT_COMMIT_THRESHOLD', 0.7);
@@ -664,7 +675,29 @@ class AIAssistantMultipleInputController extends Controller
 
             // 2) Determina os campos a incluir
             $fieldsToInclude = $requestedFields;
+            $reason = 'requested_fields';
             if (empty($fieldsToInclude)) {
+                // Se há filtros de contrato, foca em 'planos'
+                if ($this->hasMeaningfulContractFilters($contractFilters)) {
+                    $fieldsToInclude = ['planos'];
+                    $reason = 'by_contract_filters';
+                }
+            }
+            if (empty($fieldsToInclude)) {
+                // Se há filtros de período, foca em ficha financeira (ou último subcampo card relevante)
+                $hasPeriod = !empty($periodFilters['references'] ?? []) || !empty($periodFilters['months'] ?? []) || !empty($periodFilters['years'] ?? []);
+                if ($hasPeriod) {
+                    $lastPrimary = $this->getLastCardPrimaryField($conversationId);
+                    if (in_array($lastPrimary, ['fichafinanceira', 'coparticipacao'], true)) {
+                        $fieldsToInclude = [$lastPrimary];
+                    } else {
+                        $fieldsToInclude = ['fichafinanceira'];
+                    }
+                    $reason = 'by_period_filters';
+                }
+            }
+            if (empty($fieldsToInclude)) {
+                // fallback antigo: incluir blocos com dados
                 foreach ($dataMap as $field => $_) {
                     $raw = $rawByField[$field] ?? null;
                     if (is_array($raw) && !empty($raw)) {
@@ -672,7 +705,9 @@ class AIAssistantMultipleInputController extends Controller
                     }
                 }
                 $fieldsToInclude = array_values(array_unique($fieldsToInclude));
+                $reason = 'by_available_data';
             }
+            Log::info('Card.fields.decided', ['conv' => $conversationId, 'fields' => $fieldsToInclude, 'reason' => $reason]);
 
             // 3) Processa cada campo e popula o payload
             foreach ($dataMap as $field => $suffix) {
@@ -707,6 +742,8 @@ class AIAssistantMultipleInputController extends Controller
                 $requestedFields
             );
 
+            // Atualiza memória do último subcampo principal
+            $this->setLastCardPrimaryField($conversationId, $this->determinePrimaryCardField($fieldsToInclude));
             $this->clearStoredPayloadRequest($conversationId);
         } elseif ($lastTool === 'ir') {
             $payload['login'] = $shouldShowLogin;
@@ -1205,6 +1242,21 @@ class AIAssistantMultipleInputController extends Controller
         return $fields[0] ?? '';
     }
 
+    private function setLastCardPrimaryField(string $conversationId, ?string $field): void
+    {
+        if (!$field) return;
+        $key = $this->getConversationCacheKey($conversationId, 'last_card_primary_field');
+        Cache::put($key, $field, 3600);
+    }
+
+    private function getLastCardPrimaryField(string $conversationId): ?string
+    {
+        $key = $this->getConversationCacheKey($conversationId, 'last_card_primary_field');
+        $val = Cache::get($key);
+        if ($val) Cache::put($key, $val, 3600);
+        return $val ?: null;
+    }
+
     private function normalizeContractFilters($filters): array
     {
         $template = [
@@ -1243,8 +1295,9 @@ class AIAssistantMultipleInputController extends Controller
     {
         $fields = $payloadRequest['fields'] ?? [];
 
-        if (empty($fields)) {
-            return;
+        if (!empty($fields)) {
+            $primary = $this->determinePrimaryCardField($fields);
+            $this->setLastCardPrimaryField($conversationId, $primary);
         }
 
         $contractFilters = $this->normalizeContractFilters($payloadRequest['contract_filters'] ?? []);

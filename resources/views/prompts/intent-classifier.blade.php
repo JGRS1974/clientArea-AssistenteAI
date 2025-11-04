@@ -10,9 +10,17 @@
       "Se houver ambiguidade ou falta de sinal forte, use 'unknown' com confiança baixa.",
       "Defina 'confidence' em 0..1 (baixa=0.2, média=0.5~0.7, alta>=0.85).",
       "Preencha 'slots' quando claro (ex.: {\"subfields\":[\"beneficiarios\"], \"year\":\"2024\"}).",
+      "Trate mensagens elípticas usando o contexto recente: se o último tópico foi 'card' e o subcampo foi 'planos', então 'retorne os cancelados' deve mapear para 'card' com 'subfields':[\"planos\"].",
+      "Não invente parâmetro 'ano' para IR; se o usuário não especificar ano, a intenção ainda é 'ir'.",
       "Escolha apenas UMA intenção primária por vez.",
       "Mantenha consistência de canal: no WhatsApp, as mensagens tendem a ser curtas e telegráficas; no web, mais formais."
     ],
+    "context": {
+      "previous_intent": "{{ data_get($context ?? [], 'previous_intent') }}",
+      "last_tool": "{{ data_get($context ?? [], 'last_tool') }}",
+      "last_card_primary_field": "{{ data_get($context ?? [], 'last_card_primary_field') }}",
+      "last_requested_fields": {!! json_encode((array) data_get($context ?? [], 'last_requested_fields', [])) !!}
+    },
     "output_schema": {
       "type": "object",
       "required": ["intent", "confidence"],
@@ -45,6 +53,16 @@
       {
         "input": "meus pagamentos de abril 2024",
         "output": {"intent": "card", "confidence": 0.88, "slots": {"subfields":["fichafinanceira"], "period":"04/2024"}}
+      },
+      {
+        "input": "retorne os cancelados",
+        "context": {"previous_intent":"card", "last_card_primary_field":"planos"},
+        "output": {"intent": "card", "confidence": 0.82, "slots": {"subfields":["planos"]}}
+      },
+      {
+        "input": "e os de julho?",
+        "context": {"previous_intent":"card", "last_card_primary_field":"fichafinanceira"},
+        "output": {"intent": "card", "confidence": 0.8, "slots": {"subfields":["fichafinanceira"], "period":"07"}}
       },
       {
         "input": "oi",
