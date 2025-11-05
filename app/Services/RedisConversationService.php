@@ -9,9 +9,10 @@ class RedisConversationService
 {
     //private const CONVERSATION_TTL = 3600; // 1 hour
     //private const CONTEXT_TTL = 1800; // 30 minutes
-    private const MAX_MESSAGES = 10;
+    private $maxMessages;
 
     public function __construct(private $conversationRedis = null) {
+        $this->maxMessages = env('MAX_MESSAGES_REDIS', 30);
         $this->conversationRedis = Redis::connection('conversations');
     }
 
@@ -32,7 +33,7 @@ class RedisConversationService
         $this->conversationRedis->lpush($key, json_encode($message));
 
         // Mantém apenas as últimas X mensagens
-        $this->conversationRedis->ltrim($key, 0, self::MAX_MESSAGES - 1);
+        $this->conversationRedis->ltrim($key, 0, $this->maxMessages - 1);
 
         // Define TTL
         //$this->conversationRedis->expire($key, self::CONVERSATION_TTL);
@@ -43,7 +44,7 @@ class RedisConversationService
         $key = "messages:{$sessionId}";
         $this->conversationRedis->del($key);
 
-        $limited = array_slice($messages, -self::MAX_MESSAGES);
+        $limited = array_slice($messages, -$this->maxMessages);
 
         foreach (array_reverse($limited) as $message) {
             if (!is_array($message)) {
@@ -147,6 +148,6 @@ class RedisConversationService
 
     public function getMaxMessages(): int
     {
-        return self::MAX_MESSAGES;
+        return $this->maxMessages;
     }
 }
