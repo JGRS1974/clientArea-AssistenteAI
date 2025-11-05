@@ -10,7 +10,7 @@
       "Se houver ambiguidade ou falta de sinal forte, use 'unknown' com confiança baixa.",
       "Defina 'confidence' em 0..1 (baixa=0.2, média=0.5~0.7, alta>=0.85).",
       "Preencha 'slots' quando claro (ex.: {\"subfields\":[\"beneficiarios\"], \"year\":\"2024\"}).",
-      "Trate mensagens elípticas usando o contexto recente: se o último tópico foi 'card' e o subcampo foi 'planos', então 'retorne os cancelados' deve mapear para 'card' com 'subfields':[\"planos\"].",
+      "Trate mensagens elípticas usando o contexto recente (previous_intent, last_card_primary_field, last_requested_fields, recent_user_messages).",
       "Não invente parâmetro 'ano' para IR; se o usuário não especificar ano, a intenção ainda é 'ir'.",
       "Escolha apenas UMA intenção primária por vez.",
       "Mantenha consistência de canal: no WhatsApp, as mensagens tendem a ser curtas e telegráficas; no web, mais formais."
@@ -19,7 +19,8 @@
       "previous_intent": "{{ data_get($context ?? [], 'previous_intent') }}",
       "last_tool": "{{ data_get($context ?? [], 'last_tool') }}",
       "last_card_primary_field": "{{ data_get($context ?? [], 'last_card_primary_field') }}",
-      "last_requested_fields": {!! json_encode((array) data_get($context ?? [], 'last_requested_fields', [])) !!}
+      "last_requested_fields": {!! json_encode((array) data_get($context ?? [], 'last_requested_fields', [])) !!},
+      "recent_user_messages": {!! json_encode((array) data_get($context ?? [], 'recent_user_messages', [])) !!}
     },
     "output_schema": {
       "type": "object",

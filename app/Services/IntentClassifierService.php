@@ -33,6 +33,7 @@ class IntentClassifierService
                     'last_tool' => $context['last_tool'] ?? null,
                     'last_card_primary_field' => $context['last_card_primary_field'] ?? null,
                     'last_requested_fields' => $context['last_requested_fields'] ?? [],
+                    'recent_user_messages' => $context['recent_user_messages'] ?? [],
                 ],
             ])->render());
 
@@ -86,7 +87,6 @@ class IntentClassifierService
 
         // Fallback heurístico (tolerante a typos comuns)
         $normalized = $this->normalize($text);
-        $previousIntent = $context['previous_intent'] ?? null;
         if ($this->isTicketStrong($normalized)) {
             $out = ['intent' => 'ticket', 'confidence' => 0.8, 'slots' => []];
             Log::info('IntentClassifier.result', ['source' => 'fallback', 'intent' => $out['intent'], 'confidence' => $out['confidence']]);
@@ -101,14 +101,6 @@ class IntentClassifierService
             $out = ['intent' => 'card', 'confidence' => 0.7, 'slots' => []];
             Log::info('IntentClassifier.result', ['source' => 'fallback', 'intent' => $out['intent'], 'confidence' => $out['confidence']]);
             return $out;
-        }
-        // Heurística contextual: mensagem elíptica após 'card'
-        if (is_string($previousIntent) && $previousIntent === 'card') {
-            if (preg_match('/\b(cancelad[oa]s?|vigent[ea]s?|ativos?)\b/u', $normalized)) {
-                $out = ['intent' => 'card', 'confidence' => 0.7, 'slots' => ['subfields' => ['planos']]];
-                Log::info('IntentClassifier.result', ['source' => 'fallback_ctx', 'intent' => $out['intent'], 'confidence' => $out['confidence']]);
-                return $out;
-            }
         }
         if ($this->mentionsSomethingKnown($normalized)) {
             $out = ['intent' => 'unknown', 'confidence' => 0.45, 'slots' => []];

@@ -88,6 +88,7 @@ class AIAssistantMultipleInputController extends Controller
             // If maintenance helpers fail, log and continue normal flow
             Log::warning('Maintenance gate (web) failed', ['error' => $e->getMessage()]);
         }
+        Log::info('Enviado pelo usuário',['texto' => $request->text, 'conversation_id' => $request->conversation_id]);
         // Diagnóstico de entrada do /api/chat
         Log::info('Chat entry files', [
             'accept' => $request->header('accept'),
@@ -197,6 +198,23 @@ class AIAssistantMultipleInputController extends Controller
             $channel = $request->header('X-Channel', 'web');
             // Histórico curto (antes de registrar a nova mensagem)
             $history = $this->redisConversationService->getMessages($conversationId);
+            // Ordena defensivamente por timestamp ascendente (cronológico)
+            usort($history, function ($a, $b) {
+                $ta = $a['timestamp'] ?? '';
+                $tb = $b['timestamp'] ?? '';
+                return strcmp((string)$ta, (string)$tb);
+            });
+            // Coleta últimas 5 mensagens do usuário (mais novas primeiro)
+            $recentUser = [];
+            for ($i = count($history) - 1; $i >= 0 && count($recentUser) < 5; $i--) {
+                $m = $history[$i] ?? null;
+                if (is_array($m) && ($m['role'] ?? '') === 'user') {
+                    $content = trim((string) ($m['content'] ?? ''));
+                    if ($content !== '') {
+                        $recentUser[] = $content;
+                    }
+                }
+            }
             // Contexto para classificador (apoia mensagens elípticas)
             $prevIntent = $this->getStoredIntent($conversationId);
             $lastToolGate = Cache::get($this->getConversationCacheKey($conversationId, 'last_tool'));
@@ -207,6 +225,7 @@ class AIAssistantMultipleInputController extends Controller
                 'last_tool' => $lastToolGate,
                 'last_card_primary_field' => $lastPrimaryField,
                 'last_requested_fields' => $lastPayloadReq['fields'] ?? [],
+                'recent_user_messages' => $recentUser,
             ];
             $classification = $this->intentClassifier->classify($userInput, $history, $channel, $clfContext);
             $intentProposed = $classification['intent'] ?? 'unknown';
@@ -472,7 +491,7 @@ class AIAssistantMultipleInputController extends Controller
         $statusLogin = $this->resolveStatusLogin($kw, $kwStatus);
         //Log::info('statusLogin ' . $statusLogin . ' - kw ' . $kw . ' - kw_status ' . $kwStatus);
 
-        // Monta mensagens para o Prism
+        // Monta mensagens para o Prism (ordem cronológica)
         $this->cardTool->setKw($kw);
         $this->irInformTool->setKw($kw);
 
@@ -484,6 +503,13 @@ class AIAssistantMultipleInputController extends Controller
         $ticketErrorDetailKey = $this->getConversationCacheKey($conversationId, 'ticket_error_detail');
         $ticketError = Cache::get($ticketErrorKey);
         $ticketErrorDetail = Cache::get($ticketErrorDetailKey);
+
+        // Garante ordem cronológica das mensagens do histórico
+        usort($conversationMessages, function ($a, $b) {
+            $ta = $a['timestamp'] ?? '';
+            $tb = $b['timestamp'] ?? '';
+            return strcmp((string)$ta, (string)$tb);
+        });
 
         $messages = [
             new SystemMessage(view('prompts.assistant-prompt', [
@@ -742,8 +768,9 @@ class AIAssistantMultipleInputController extends Controller
                 $requestedFields
             );
 
-            // Atualiza memória do último subcampo principal
+            // Atualiza memória do último subcampo principal e subcampos
             $this->setLastCardPrimaryField($conversationId, $this->determinePrimaryCardField($fieldsToInclude));
+            $this->setLastCardSubfields($conversationId, $fieldsToInclude);
             $this->clearStoredPayloadRequest($conversationId);
         } elseif ($lastTool === 'ir') {
             $payload['login'] = $shouldShowLogin;
@@ -909,7 +936,7 @@ class AIAssistantMultipleInputController extends Controller
         return $this->resolveStatusLogin($kw, $kwStatus) !== 'usuário logado';
     }
 
-    
+
 
     private function detectPayloadRequestFromMessage(string $message): array
     {
@@ -1298,6 +1325,7 @@ class AIAssistantMultipleInputController extends Controller
         if (!empty($fields)) {
             $primary = $this->determinePrimaryCardField($fields);
             $this->setLastCardPrimaryField($conversationId, $primary);
+            $this->setLastCardSubfields($conversationId, $fields);
         }
 
         $contractFilters = $this->normalizeContractFilters($payloadRequest['contract_filters'] ?? []);
@@ -1321,6 +1349,24 @@ class AIAssistantMultipleInputController extends Controller
 
         $cacheKey = $this->getConversationCacheKey($conversationId, 'card_payload_request');
         Cache::put($cacheKey, $payload, 3600);
+    }
+
+    private function setLastCardSubfields(string $conversationId, array $fields): void
+    {
+        $clean = array_values(array_filter(array_map(function ($f) { return is_string($f) ? trim($f) : ''; }, $fields)));
+        $key = $this->getConversationCacheKey($conversationId, 'last_card_subfields');
+        Cache::put($key, $clean, 3600);
+    }
+
+    private function getLastCardSubfields(string $conversationId): array
+    {
+        $key = $this->getConversationCacheKey($conversationId, 'last_card_subfields');
+        $val = Cache::get($key);
+        if (is_array($val)) {
+            Cache::put($key, $val, 3600);
+            return $val;
+        }
+        return [];
     }
 
     private function getStoredPayloadRequest(string $conversationId): array
@@ -1779,7 +1825,7 @@ class AIAssistantMultipleInputController extends Controller
         return false;
     }
 
-    
+
 
     private function isPlansEmpty(array $plans): bool
     {

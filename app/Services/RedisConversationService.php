@@ -24,6 +24,7 @@ class RedisConversationService
         $message = [
             'role' => $role,
             'content' => $content,
+            'conversationId' => $sessionId,
             'timestamp' => now()->toISOString(),
         ];
 
@@ -50,6 +51,8 @@ class RedisConversationService
             if (!is_array($message)) {
                 continue;
             }
+            // Garante que cada item possua o conversationId correto
+            $message['conversationId'] = $sessionId;
             $this->conversationRedis->lpush($key, json_encode($message));
         }
     }
