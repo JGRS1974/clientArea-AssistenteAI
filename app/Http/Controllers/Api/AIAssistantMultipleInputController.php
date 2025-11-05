@@ -257,10 +257,14 @@ class AIAssistantMultipleInputController extends Controller
 
             // Seleção de ferramentas com base na intenção do turno
             $intentForTurn = $intentProposed; // usa a intenção proposta neste turno
+            $isImageTurn = $request->hasFile('image');
             if ($intentForTurn === 'unknown') {
-                $storedIntentForTurn = $this->getStoredIntent($conversationId);
-                if (is_string($storedIntentForTurn) && $storedIntentForTurn !== '') {
-                    $intentForTurn = $storedIntentForTurn;
+                // Em turnos com imagem/pdf e intenção desconhecida, não herda intenção persistida
+                if (!$isImageTurn) {
+                    $storedIntentForTurn = $this->getStoredIntent($conversationId);
+                    if (is_string($storedIntentForTurn) && $storedIntentForTurn !== '') {
+                        $intentForTurn = $storedIntentForTurn;
+                    }
                 }
             }
 
@@ -297,6 +301,7 @@ class AIAssistantMultipleInputController extends Controller
                 'intent' => $intentForTurn,
                 'has_cpf' => (bool) $storedCpf,
                 'is_logged_in' => $isLoggedIn,
+                'is_file_turn' => (bool) $isImageTurn,
                 'tools' => array_map(fn($t) => is_object($t) ? get_class($t) : (string) $t, $tools),
             ]);
 
@@ -314,8 +319,14 @@ class AIAssistantMultipleInputController extends Controller
                 ]);
             }
 
-            // Fallback: garantir execução da TicketTool quando intenção for 'ticket' e já houver CPF
+            // Fallback: garantir execução das tools quando aplicável
+            // Observação: em turnos com imagem/pdf e intenção proposta 'unknown', não executar fallback
             try {
+                if ($isImageTurn && $intentProposed === 'unknown') {
+                    Log::info('Tools.fallback.skip_file_unknown', [
+                        'conv' => $conversationId,
+                    ]);
+                } else {
                 $currentIntent = $this->getStoredIntent($conversationId);
                 if ($currentIntent === 'ticket') {
                     $storedCpf = $this->getStoredCpf($conversationId);
@@ -366,6 +377,7 @@ class AIAssistantMultipleInputController extends Controller
                         $this->irInformTool->__invoke($storedCpf, null, $kw);
                         Log::info('Ir.fallback.invoked', ['conv' => $conversationId]);
                     }
+                }
                 }
             } catch (\Throwable $e) {
                 Log::warning('Ticket fallback execution failed', ['error' => $e->getMessage()]);
