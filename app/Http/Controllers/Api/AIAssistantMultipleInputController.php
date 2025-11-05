@@ -303,9 +303,16 @@ class AIAssistantMultipleInputController extends Controller
             // Gera resposta da AI (com tools já decididas)
             $response = $this->generateAIResponse($conversationId, $kw, $tools, $intentForTurn);
             //ds(['Response AI' => $response]);
-            // Adiciona resposta da AI à conversa
-            //$this->conversationService->addMessage($conversationId, 'assistant', $response);
-            $this->redisConversationService->addMessage($conversationId,'assistant', $response);
+            // Adiciona resposta da AI à conversa somente se houver texto
+            if (is_string($response) && trim($response) !== '') {
+                //$this->conversationService->addMessage($conversationId, 'assistant', $response);
+                $this->redisConversationService->addMessage($conversationId,'assistant', $response);
+            } else {
+                Log::info('Assistant.message.skip_null', [
+                    'conv' => $conversationId,
+                    'reason' => 'empty_or_null_response'
+                ]);
+            }
 
             // Fallback: garantir execução da TicketTool quando intenção for 'ticket' e já houver CPF
             try {
@@ -541,6 +548,16 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         try{
+            // Rate limit short-circuit (global ou por conversa)
+            $globalBackoffKey = 'prism:rate_limited';
+            $convBackoffKey = $this->getConversationCacheKey($conversationId, 'prism_rate_limited');
+            if (Cache::get($globalBackoffKey) || Cache::get($convBackoffKey)) {
+                Log::warning('Prism.skip.rate_limited', [
+                    'conv' => $conversationId,
+                ]);
+                return 'Estou com instabilidade no momento. Já continuo assim que possível.';
+            }
+
             Log::info('Prism.start', [
                 'conv' => $conversationId,
                 'intent_in_prompt' => $intentForTurn,
@@ -569,8 +586,23 @@ class AIAssistantMultipleInputController extends Controller
 
         } catch (PrismException $e) {
             Log::error('Text generation failed:', ['error' => $e->getMessage()]);
+            $msg = (string) $e->getMessage();
+            $seconds = (int) env('PRISM_RATE_LIMIT_BACKOFF_SECONDS', 12);
+            if ($seconds < 1) { $seconds = 12; }
+            if (stripos($msg, 'rate limit') !== false) {
+                $globalBackoffKey = 'prism:rate_limited';
+                $convBackoffKey = $this->getConversationCacheKey($conversationId, 'prism_rate_limited');
+                Cache::put($globalBackoffKey, true, now()->addSeconds($seconds));
+                Cache::put($convBackoffKey, true, now()->addSeconds($seconds));
+                Log::warning('Prism.rate_limited', [
+                    'conv' => $conversationId,
+                    'backoff_seconds' => $seconds,
+                ]);
+            }
+            return 'Estou com instabilidade no momento. Já continuo assim que possível.';
         } catch (Throwable $e) {
             Log::error('Generic error:', ['error' => $e->getMessage()]);
+            return 'Estou com instabilidade no momento. Já continuo assim que possível.';
         }
     }
 
