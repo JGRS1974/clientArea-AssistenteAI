@@ -571,10 +571,10 @@ class AIAssistantMultipleInputController extends Controller
                 ->withMaxSteps(3)
                 ->withTools($tools)
                 ->withProviderOptions([
-                    'temperature' => 0.85,
-                    'top_p' => 0.9,
-                    'frequency_penalty' => 0.3,
-                    'presence_penalty' => 0.2,
+                    'temperature' => 0.5,
+                    'top_p' => 0.8,
+                    'frequency_penalty' => 0.2,
+                    'presence_penalty' => 0.1,
                 ])
                 ->asText();
             Log::info('Prism.reply', [
