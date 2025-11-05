@@ -257,6 +257,12 @@ class AIAssistantMultipleInputController extends Controller
 
             // Seleção de ferramentas com base na intenção do turno
             $intentForTurn = $intentProposed; // usa a intenção proposta neste turno
+            if ($intentForTurn === 'unknown') {
+                $storedIntentForTurn = $this->getStoredIntent($conversationId);
+                if (is_string($storedIntentForTurn) && $storedIntentForTurn !== '') {
+                    $intentForTurn = $storedIntentForTurn;
+                }
+            }
 
             $storedCpf = $this->getStoredCpf($conversationId);
             $kwStatusKey = $this->getConversationCacheKey($conversationId, 'kw_status');
@@ -723,6 +729,13 @@ class AIAssistantMultipleInputController extends Controller
                 }
             }
             if (empty($fieldsToInclude)) {
+                $lastSubfields = $this->getLastCardSubfields($conversationId);
+                if (!empty($lastSubfields)) {
+                    $fieldsToInclude = $lastSubfields;
+                    $reason = 'by_last_subfields';
+                }
+            }
+            if (empty($fieldsToInclude)) {
                 // fallback antigo: incluir blocos com dados
                 foreach ($dataMap as $field => $_) {
                     $raw = $rawByField[$field] ?? null;
@@ -765,7 +778,7 @@ class AIAssistantMultipleInputController extends Controller
             $payload['text'] = $this->adjustCardText(
                 $originalText,
                 $payload,
-                $requestedFields
+                $fieldsToInclude
             );
 
             // Atualiza memória do último subcampo principal e subcampos
@@ -1320,34 +1333,60 @@ class AIAssistantMultipleInputController extends Controller
 
     private function storePayloadRequest(string $conversationId, array $payloadRequest): void
     {
-        $fields = $payloadRequest['fields'] ?? [];
-
-        if (!empty($fields)) {
-            $primary = $this->determinePrimaryCardField($fields);
-            $this->setLastCardPrimaryField($conversationId, $primary);
-            $this->setLastCardSubfields($conversationId, $fields);
-        }
+        $fields = array_values(array_unique(array_filter($payloadRequest['fields'] ?? [], function ($field) {
+            return is_string($field) && trim($field) !== '';
+        })));
 
         $contractFilters = $this->normalizeContractFilters($payloadRequest['contract_filters'] ?? []);
-        $periodFilters = $payloadRequest['period_filters'] ?? [
+        $periodFiltersInput = $payloadRequest['period_filters'] ?? [
             'references' => [],
             'months' => [],
             'years' => [],
         ];
-
         $periodFilters = [
-            'references' => array_values(array_unique($periodFilters['references'] ?? [])),
-            'months' => array_values(array_unique($periodFilters['months'] ?? [])),
-            'years' => array_values(array_unique($periodFilters['years'] ?? [])),
+            'references' => array_values(array_unique($periodFiltersInput['references'] ?? [])),
+            'months' => array_values(array_unique($periodFiltersInput['months'] ?? [])),
+            'years' => array_values(array_unique($periodFiltersInput['years'] ?? [])),
         ];
 
+        $hasFields = !empty($fields);
+        $hasContractFilters = $this->hasMeaningfulContractFilters($contractFilters);
+        $hasPeriodFilters = !empty($periodFilters['references']) || !empty($periodFilters['months']) || !empty($periodFilters['years']);
+
+        $cacheKey = $this->getConversationCacheKey($conversationId, 'card_payload_request');
+        $existingPayload = $this->getStoredPayloadRequest($conversationId);
+
+        if (!$hasFields && !$hasContractFilters && !$hasPeriodFilters) {
+            if (!empty($existingPayload)) {
+                Cache::put($cacheKey, $existingPayload, 3600);
+            }
+            $this->getLastCardPrimaryField($conversationId);
+            $this->getLastCardSubfields($conversationId);
+            return;
+        }
+
+        if ($hasFields) {
+            $primary = $this->determinePrimaryCardField($fields);
+            if ($primary !== '') {
+                $this->setLastCardPrimaryField($conversationId, $primary);
+            }
+            $this->setLastCardSubfields($conversationId, $fields);
+        } else {
+            $this->getLastCardPrimaryField($conversationId);
+            $this->getLastCardSubfields($conversationId);
+        }
+
         $payload = [
-            'fields' => array_values(array_unique($fields)),
+            'fields' => $fields,
             'contract_filters' => $contractFilters,
             'period_filters' => $periodFilters,
         ];
 
-        $cacheKey = $this->getConversationCacheKey($conversationId, 'card_payload_request');
+        if ($existingPayload === $payload) {
+            Cache::put($cacheKey, $existingPayload, 3600);
+            return;
+        }
+
         Cache::put($cacheKey, $payload, 3600);
     }
 
@@ -2086,23 +2125,79 @@ class AIAssistantMultipleInputController extends Controller
     {
         $normalized = Str::lower(Str::ascii($text));
 
+        if ($normalized === '') {
+            return false;
+        }
+
+        $negativePatterns = [
+            'nao fiz login',
+            'nao fiz o login',
+            'nao fiz meu login',
+            'nao realizei login',
+            'nao loguei',
+            'ainda nao loguei',
+            'ainda nao fiz login',
+            'nao estou logado',
+            'nao estou logada',
+            'nao entrei na conta',
+            'nao acessei a conta',
+            'desloguei',
+            'deslogado',
+            'deslogada',
+            'sem login',
+        ];
+
+        foreach ($negativePatterns as $negative) {
+            if (str_contains($normalized, $negative)) {
+                return false;
+            }
+        }
+
         $patterns = [
             'ja fiz login',
-            'já fiz login',
             'ja fiz o login',
-            'já fiz o login',
+            'ja fiz meu login',
             'fiz login',
+            'fiz meu login',
             'login concluido',
-            'login concluído',
-            'já realizei o login',
+            'login concluido',
+            'login realizado',
+            'login efetuado',
+            'login ok',
+            'login certo',
+            'login deu certo',
             'ja realizei o login',
+            'realizei o login',
             'acabei de fazer login',
+            'acabei de logar',
+            'acabei de entrar na conta',
+            'acabei de acessar a conta',
+            'acabei de acessar minha conta',
+            'ja estou logado',
+            'estou logado',
+            'ja estou logada',
+            'estou logada',
+            'ja loguei',
+            'loguei',
+            'acessei a conta',
+            'acessei minha conta',
+            'entrei na conta',
+            'ja entrei na conta',
+            'acesso realizado',
         ];
 
         foreach ($patterns as $pattern) {
-            if (str_contains($normalized, Str::ascii($pattern))) {
+            if (str_contains($normalized, $pattern)) {
                 return true;
             }
+        }
+
+        if (preg_match('/\blogad[ao]\b/u', $normalized)) {
+            return !str_contains($normalized, 'deslogad');
+        }
+
+        if (preg_match('/\blogue[iu]\b/u', $normalized)) {
+            return true;
         }
 
         return false;
