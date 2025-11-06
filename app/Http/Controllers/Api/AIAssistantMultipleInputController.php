@@ -175,6 +175,20 @@ class AIAssistantMultipleInputController extends Controller
                     $this->syncKwStatusWithHeader($conversationId, $kw);
                 }
             }
+            // Sinaliza se este turno contém arquivo/imagem e se extraímos CPF
+            $isImageTurnFlag = $request->hasFile('image');
+            $fileKind = null;
+            if ($isImageTurnFlag) {
+                try {
+                    $ext = strtolower((string) $request->file('image')->getClientOriginalExtension());
+                    $fileKind = $ext === 'pdf' ? 'pdf' : 'image';
+                } catch (\Throwable $e) {
+                    $fileKind = 'image';
+                }
+            }
+            Cache::put($this->getConversationCacheKey($conversationId, 'is_file_turn'), (bool) $isImageTurnFlag, 600);
+            Cache::put($this->getConversationCacheKey($conversationId, 'file_kind'), $fileKind, 600);
+            Cache::put($this->getConversationCacheKey($conversationId, 'cpf_extracted_this_turn'), (bool) $detectedCpf, 600);
 
             $isLoginConfirmation = $this->looksLikeLoginConfirmation($userInput);
 
@@ -323,9 +337,26 @@ class AIAssistantMultipleInputController extends Controller
             // Observação: em turnos com imagem/pdf e intenção proposta 'unknown', não executar fallback
             try {
                 if ($isImageTurn && $intentProposed === 'unknown') {
-                    Log::info('Tools.fallback.skip_file_unknown', [
-                        'conv' => $conversationId,
-                    ]);
+                    $currentIntent = $this->getStoredIntent($conversationId);
+                    $storedCpfForFile = $this->getStoredCpf($conversationId);
+                    if ($currentIntent === 'ticket' && $storedCpfForFile && strlen($storedCpfForFile) === 11) {
+                        $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
+                        $lastTool = Cache::get($lastToolKey);
+                        Log::info('Ticket.fallback.from_file_turn', [
+                            'conv' => $conversationId,
+                            'has_cpf' => true,
+                            'last_tool' => $lastTool,
+                        ]);
+                        if ($lastTool !== 'ticket') {
+                            $this->ticketTool->setConversationId($conversationId);
+                            $this->ticketTool->__invoke($storedCpfForFile);
+                            Log::info('Ticket.fallback.invoked', ['conv' => $conversationId]);
+                        }
+                    } else {
+                        Log::info('Tools.fallback.skip_file_unknown', [
+                            'conv' => $conversationId,
+                        ]);
+                    }
                 } else {
                 $currentIntent = $this->getStoredIntent($conversationId);
                 if ($currentIntent === 'ticket') {
@@ -548,6 +579,10 @@ class AIAssistantMultipleInputController extends Controller
                 'ticketError' => $ticketError,
                 'ticketErrorDetail' => $ticketErrorDetail,
                 'intentNow' => $intentForTurn ?? $this->getStoredIntent($conversationId),
+                // Flags de turno com arquivo
+                'isFileTurn' => (bool) Cache::get($this->getConversationCacheKey($conversationId, 'is_file_turn')),
+                'fileKind' => Cache::get($this->getConversationCacheKey($conversationId, 'file_kind')),
+                'cpfExtractedThisTurn' => (bool) Cache::get($this->getConversationCacheKey($conversationId, 'cpf_extracted_this_turn')),
             ])->render())
         ];
         //Log::info('PROMPT' , $messages);
