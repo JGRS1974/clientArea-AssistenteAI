@@ -16,8 +16,8 @@ class WhatsAppSender
      */
     public function sendText(string $phone, string $text): array
     {
-        $base = rtrim(env('EVOLUTION_BASE_URL'), '/');
-        $instance = env('EVOLUTION_INSTANCE');
+        $base = rtrim(trim((string) env('EVOLUTION_BASE_URL')), '/');
+        $instance = trim((string) env('EVOLUTION_INSTANCE'));
         $token = env('EVOLUTION_API_KEY');
 
         //$url = sprintf('%s/v2/%s/message/send-text', $base, $instance);
@@ -41,8 +41,8 @@ class WhatsAppSender
      */
     public function sendAudioByUrl(string $phone, string $audioUrl, bool $asPtt = true): array
     {
-        $base = rtrim(env('EVOLUTION_BASE_URL'), '/');
-        $instance = env('EVOLUTION_INSTANCE');
+        $base = rtrim(trim((string) env('EVOLUTION_BASE_URL')), '/');
+        $instance = trim((string) env('EVOLUTION_INSTANCE'));
         $token = env('EVOLUTION_API_KEY');
 
         //$url = sprintf('%s/v2/%s/message/send-audio', $base, $instance);
@@ -63,8 +63,8 @@ class WhatsAppSender
 
     public function sendButton(string $phone, string $text, array $buttons, ?string $footer = null): array
     {
-        $base = rtrim(env('EVOLUTION_BASE_URL'), '/');
-        $instance = env('EVOLUTION_INSTANCE');
+        $base = rtrim(trim((string) env('EVOLUTION_BASE_URL')), '/');
+        $instance = trim((string) env('EVOLUTION_INSTANCE'));
         $token = env('EVOLUTION_API_KEY');
 
         $url = sprintf('%s/message/sendButtons/%s', $base, $instance);
