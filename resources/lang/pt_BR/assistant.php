@@ -3,24 +3,18 @@
 return [
     'follow_up' => [
         'default' => [
-            'Posso ajudar em mais alguma coisa?',
-            'Quer apoio com mais algum assunto?',
-            'Precisa de algo mais?',
-            'Posso ajudar com outra dúvida?',
+            'Precisa de outra consulta?',
+            'Quer que eu verifique mais alguma informação?',
+            'Posso conferir outro dado para você?',
         ],
     ],
     'login' => [
         'required' => [
             'generic' => [
-                'Você precisa estar logado para consultar :label.<br>Faça login e me avise, por favor. 🙂',
-                'Você precisa estar logado para consultar :label.<br>Faça login e me avise, obrigado.',
-                'Para acessar :label, faça login e me avise quando concluir. Obrigado. 🙂',
-                'Faça login para liberar :label e me avise ao terminar, por favor. 🙂',
+                'Para acessar :label, é preciso estar logado. Por favor, faça login e me avise aqui quando terminar. Assim, consigo te ajudar!'
             ],
             'ir' => [
-                'Você precisa estar logado para consultar seu informe de rendimentos.<br>Faça login pelo link e, quando terminar, diga "pronto". 🙂',
-                'Para liberar o informe de rendimentos, realize o login pelo link e me avise respondendo "pronto". 🙂',
-                'Acesse pelo link para liberar o informe de rendimentos e, ao concluir, responda "pronto" para eu continuar. 🙂',
+                'Para acessar seu informe de rendimentos (IR), é preciso estar logado. Por favor, faça login e me avise aqui quando terminar. Assim, consigo te ajudar!'
             ],
         ],
     ],
@@ -108,7 +102,7 @@ return [
     ],
     'labels' => [
         'planos' => 'seus planos',
-        'fichafinanceira' => 'seus pagamentos (relatório financeiro)',
+        'fichafinanceira' => 'seus pagamentos',
         'coparticipacao' => 'sua coparticipação',
         'beneficiarios' => 'sua carteirinha',
         'default' => 'sua carteirinha',

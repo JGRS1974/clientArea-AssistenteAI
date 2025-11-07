@@ -109,6 +109,11 @@ class TicketTool extends Tool
                     }
 
                     if ($handled) {
+                        \Log::info('Ticket.error.handled', [
+                            'conv' => $this->conversationId,
+                            'code' => $handled['code'] ?? null,
+                            'detail' => $handled['detail'] ?? null,
+                        ]);
                         $this->signalTicketError($handled['code'], $handled['detail'] ?? null);
                         $this->storeTicketData([]);
                         return $handled['message'];
@@ -125,6 +130,12 @@ class TicketTool extends Tool
                 }
 
                 $this->storeTicketData($tickets);
+                \Log::info('Ticket.summary', [
+                    'conv' => $this->conversationId,
+                    'available_count' => $availableCount,
+                    'unavailable_count' => $unavailableCount,
+                    'total' => count($tickets),
+                ]);
 
                 if ($availableCount > 0 && $unavailableCount === 0) {
                     $this->clearTicketError();
@@ -156,6 +167,11 @@ class TicketTool extends Tool
 
             $handled = $this->handleTicketErrorResponse($responseCollection);
             if ($handled) {
+                \Log::info('Ticket.error.handled', [
+                    'conv' => $this->conversationId,
+                    'code' => $handled['code'] ?? null,
+                    'detail' => $handled['detail'] ?? null,
+                ]);
                 $this->signalTicketError($handled['code'], $handled['detail'] ?? null);
                 $this->clearTicketData();
                 return $handled['message'];

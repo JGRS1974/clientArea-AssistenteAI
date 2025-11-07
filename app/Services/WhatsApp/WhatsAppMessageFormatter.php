@@ -31,7 +31,7 @@ class WhatsAppMessageFormatter
 
             // Quando exigir login, mantém o padrão de enviar o link logo após a saudação
             if ($loginUrl && ($payload['login'] ?? false) === true) {
-                $messages[] = ($intro !== '' ? $intro . "\nAcesse:" : "Acesse:");
+                $messages[] = ($intro !== '' ? $intro . "\nFaça login aqui:" : "Faça login aqui:");
                 $messages[] = $loginUrl;
             } else {
                 if ($intro !== '') {

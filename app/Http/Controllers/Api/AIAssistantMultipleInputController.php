@@ -189,6 +189,9 @@ class AIAssistantMultipleInputController extends Controller
             Cache::put($this->getConversationCacheKey($conversationId, 'is_file_turn'), (bool) $isImageTurnFlag, 600);
             Cache::put($this->getConversationCacheKey($conversationId, 'file_kind'), $fileKind, 600);
             Cache::put($this->getConversationCacheKey($conversationId, 'cpf_extracted_this_turn'), (bool) $detectedCpf, 600);
+            // Marca erro de análise de imagem neste turno, se aplicável
+            $imageErrorThisTurn = str_contains($userInput, '[Erro na análise da imagem]');
+            Cache::put($this->getConversationCacheKey($conversationId, 'image_error_this_turn'), $imageErrorThisTurn, 600);
 
             $isLoginConfirmation = $this->looksLikeLoginConfirmation($userInput);
 
@@ -272,36 +275,50 @@ class AIAssistantMultipleInputController extends Controller
             // Seleção de ferramentas com base na intenção do turno
             $intentForTurn = $intentProposed; // usa a intenção proposta neste turno
             $isImageTurn = $request->hasFile('image');
+            $storedCpf = $this->getStoredCpf($conversationId);
+            $cpfFromThisTurn = (bool) Cache::get($this->getConversationCacheKey($conversationId, 'cpf_extracted_this_turn'));
+            // Ajuste fino: reaproveita intenção persistida quando o classificador não consegue
             if ($intentForTurn === 'unknown') {
-                // Em turnos com imagem/pdf e intenção desconhecida, não herda intenção persistida
-                if (!$isImageTurn) {
-                    $storedIntentForTurn = $this->getStoredIntent($conversationId);
-                    if (is_string($storedIntentForTurn) && $storedIntentForTurn !== '') {
-                        $intentForTurn = $storedIntentForTurn;
-                    }
+                $storedIntentForTurn = $this->getStoredIntent($conversationId);
+                if (!$isImageTurn && $detectedCpf && is_string($storedIntentForTurn) && $storedIntentForTurn !== '') {
+                    $intentForTurn = $storedIntentForTurn;
+                } elseif ($isImageTurn && $cpfFromThisTurn && $storedCpf && is_string($storedIntentForTurn) && $storedIntentForTurn !== '') {
+                    $intentForTurn = $storedIntentForTurn;
                 }
             }
-
-            $storedCpf = $this->getStoredCpf($conversationId);
             $kwStatusKey = $this->getConversationCacheKey($conversationId, 'kw_status');
             $kwStatus = Cache::get($kwStatusKey);
             $statusLogin = $this->resolveStatusLogin($kw, $kwStatus);
 
             $tools = [];
             $isLoggedIn = $statusLogin === 'usuário logado';
+            // Fonte do CPF para logs/diagnóstico
+            if ($isImageTurn) {
+                $cpfSource = $cpfFromThisTurn ? 'file' : 'none';
+            } else {
+                $cpfSource = $detectedCpf ? 'text' : ($storedCpf ? 'session' : 'none');
+            }
+            $blockedReason = null;
             switch ($intentForTurn) {
                 case 'ticket':
-                    if ($storedCpf) {
+                    // Em turno com arquivo sem CPF no próprio arquivo, não executar
+                    if ($isImageTurn && !$cpfFromThisTurn) {
+                        $blockedReason = 'file_without_cpf';
+                    } elseif ($storedCpf) {
                         $tools[] = $this->ticketTool;
                     }
                     break;
                 case 'card':
-                    if ($storedCpf && $isLoggedIn) {
+                    if ($isImageTurn && !$cpfFromThisTurn) {
+                        $blockedReason = 'file_without_cpf';
+                    } elseif ($storedCpf && $isLoggedIn) {
                         $tools[] = $this->cardTool;
                     }
                     break;
                 case 'ir':
-                    if ($storedCpf && $isLoggedIn) {
+                    if ($isImageTurn && !$cpfFromThisTurn) {
+                        $blockedReason = 'file_without_cpf';
+                    } elseif ($storedCpf && $isLoggedIn) {
                         $tools[] = $this->irInformTool;
                     }
                     break;
@@ -310,12 +327,19 @@ class AIAssistantMultipleInputController extends Controller
                     break;
             }
 
+            // Telemetria: arquivo com CPF mas sem intenção explícita no turno
+            if ($blockedReason === null && $isImageTurn && $cpfFromThisTurn && $intentForTurn === 'unknown') {
+                $blockedReason = 'file_cpf_no_intent';
+            }
+
             Log::info('Tools.gating', [
                 'conv' => $conversationId,
                 'intent' => $intentForTurn,
                 'has_cpf' => (bool) $storedCpf,
                 'is_logged_in' => $isLoggedIn,
                 'is_file_turn' => (bool) $isImageTurn,
+                'cpf_source' => $cpfSource,
+                'blocked_reason' => $blockedReason,
                 'tools' => array_map(fn($t) => is_object($t) ? get_class($t) : (string) $t, $tools),
             ]);
 
@@ -334,81 +358,154 @@ class AIAssistantMultipleInputController extends Controller
             }
 
             // Fallback: garantir execução das tools quando aplicável
-            // Observação: em turnos com imagem/pdf e intenção proposta 'unknown', não executar fallback
+            // Observações:
+            // - Em turnos com imagem/pdf SEM CPF extraído do próprio arquivo, não executar fallback de tools sensíveis.
+            // - Em mensagens elípticas (intentProposed 'unknown') sem CPF informado neste turno, não executar fallback.
+            // - Se o usuário informou CPF neste turno (texto) mesmo com intentProposed 'unknown', executar fallback usando a intenção persistida.
             try {
-                if ($isImageTurn && $intentProposed === 'unknown') {
-                    $currentIntent = $this->getStoredIntent($conversationId);
-                    $storedCpfForFile = $this->getStoredCpf($conversationId);
-                    if ($currentIntent === 'ticket' && $storedCpfForFile && strlen($storedCpfForFile) === 11) {
-                        $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
-                        $lastTool = Cache::get($lastToolKey);
-                        Log::info('Ticket.fallback.from_file_turn', [
+                $cpfFromThisTurn = (bool) Cache::get($this->getConversationCacheKey($conversationId, 'cpf_extracted_this_turn'));
+                if ($isImageTurn) {
+                    if (!$cpfFromThisTurn) {
+                        Log::info('Tools.fallback.skip_file_without_cpf', [
                             'conv' => $conversationId,
-                            'has_cpf' => true,
-                            'last_tool' => $lastTool,
                         ]);
-                        if ($lastTool !== 'ticket') {
-                            $this->ticketTool->setConversationId($conversationId);
-                            $this->ticketTool->__invoke($storedCpfForFile);
-                            Log::info('Ticket.fallback.invoked', ['conv' => $conversationId]);
+                    } elseif ($intentProposed === 'unknown') {
+                        // Se havia pedido de boleto pendente e o CPF veio via arquivo, execute a consulta de boletos
+                        $pending = Cache::get($this->getConversationCacheKey($conversationId, 'pending_request'));
+                        $pendingIntent = is_array($pending) ? ($pending['intent'] ?? null) : null;
+                        if (!$pendingIntent) {
+                            $pendingIntent = $this->getStoredIntent($conversationId);
+                        }
+                        if ($pendingIntent === 'ticket') {
+                            $storedCpf = $this->getStoredCpf($conversationId);
+                            if ($storedCpf && strlen($storedCpf) === 11) {
+                                $this->ticketTool->setConversationId($conversationId);
+                                $this->ticketTool->__invoke($storedCpf);
+                                Log::info('Pending.run.ticket.file_turn', ['conv' => $conversationId]);
+                            } else {
+                                Log::info('Pending.skip_reason', ['conv' => $conversationId, 'reason' => 'no_cpf_after_file_turn_for_ticket']);
+                            }
+                        } else {
+                            Log::info('Tools.fallback.skip_file_unknown_intent', [
+                                'conv' => $conversationId,
+                            ]);
                         }
                     } else {
-                        Log::info('Tools.fallback.skip_file_unknown', [
-                            'conv' => $conversationId,
-                        ]);
+                        // Intenção explícita em turno de arquivo: executar fallback normal
+                        $currentIntent = $this->getStoredIntent($conversationId);
+                        if ($currentIntent === 'ticket') {
+                            $storedCpf = $this->getStoredCpf($conversationId);
+                            $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
+                            $lastTool = Cache::get($lastToolKey);
+                            Log::info('Ticket.fallback.check', [
+                                'conv' => $conversationId,
+                                'has_cpf' => (bool) $storedCpf,
+                                'last_tool' => $lastTool,
+                            ]);
+                            if ($storedCpf && strlen($storedCpf) === 11 && $lastTool !== 'ticket') {
+                                $this->ticketTool->setConversationId($conversationId);
+                                $this->ticketTool->__invoke($storedCpf);
+                                Log::info('Ticket.fallback.invoked', ['conv' => $conversationId]);
+                            }
+                        } elseif ($currentIntent === 'card') {
+                            $storedCpf = $this->getStoredCpf($conversationId);
+                            $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
+                            $lastTool = Cache::get($lastToolKey);
+                            $loginOk = !$this->shouldShowLoginButton($conversationId, $kw);
+                            Log::info('Card.fallback.check', [
+                                'conv' => $conversationId,
+                                'has_cpf' => (bool) $storedCpf,
+                                'login_ok' => $loginOk,
+                                'last_tool' => $lastTool,
+                            ]);
+                            if ($storedCpf && strlen($storedCpf) === 11 && $loginOk && $lastTool !== 'card') {
+                                $this->cardTool->setConversationId($conversationId);
+                                $this->cardTool->setKw($kw);
+                                $this->cardTool->__invoke($storedCpf, $kw);
+                                Log::info('Card.fallback.invoked', ['conv' => $conversationId]);
+                            }
+                        } elseif ($currentIntent === 'ir') {
+                            $storedCpf = $this->getStoredCpf($conversationId);
+                            $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
+                            $lastTool = Cache::get($lastToolKey);
+                            $loginOk = !$this->shouldShowLoginButton($conversationId, $kw);
+                            Log::info('Ir.fallback.check', [
+                                'conv' => $conversationId,
+                                'has_cpf' => (bool) $storedCpf,
+                                'login_ok' => $loginOk,
+                                'last_tool' => $lastTool,
+                            ]);
+                            if ($storedCpf && strlen($storedCpf) === 11 && $loginOk && $lastTool !== 'ir') {
+                                $this->irInformTool->setConversationId($conversationId);
+                                $this->irInformTool->setKw($kw);
+                                $this->irInformTool->__invoke($storedCpf, null, $kw);
+                                Log::info('Ir.fallback.invoked', ['conv' => $conversationId]);
+                            }
+                        }
                     }
                 } else {
-                $currentIntent = $this->getStoredIntent($conversationId);
-                if ($currentIntent === 'ticket') {
-                    $storedCpf = $this->getStoredCpf($conversationId);
-                    $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
-                    $lastTool = Cache::get($lastToolKey);
-                    Log::info('Ticket.fallback.check', [
-                        'conv' => $conversationId,
-                        'has_cpf' => (bool) $storedCpf,
-                        'last_tool' => $lastTool,
-                    ]);
-                    if ($storedCpf && strlen($storedCpf) === 11 && $lastTool !== 'ticket') {
-                        $this->ticketTool->setConversationId($conversationId);
-                        // Executa a tool para popular conv:{id}:boletos e last_tool='ticket'
-                        $this->ticketTool->__invoke($storedCpf);
-                        Log::info('Ticket.fallback.invoked', ['conv' => $conversationId]);
+                    if ($intentProposed === 'unknown' && !$cpfFromThisTurn) {
+                        Log::info('Tools.fallback.skip_elliptical_unknown', [
+                            'conv' => $conversationId,
+                        ]);
+                    } else {
+                        if ($intentProposed === 'unknown' && $cpfFromThisTurn) {
+                            Log::info('Tools.fallback.cpf_slot_turn', [
+                                'conv' => $conversationId,
+                            ]);
+                        }
+                        $currentIntent = $this->getStoredIntent($conversationId);
+                        if ($currentIntent === 'ticket') {
+                            $storedCpf = $this->getStoredCpf($conversationId);
+                            $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
+                            $lastTool = Cache::get($lastToolKey);
+                            Log::info('Ticket.fallback.check', [
+                                'conv' => $conversationId,
+                                'has_cpf' => (bool) $storedCpf,
+                                'last_tool' => $lastTool,
+                            ]);
+                            if ($storedCpf && strlen($storedCpf) === 11 && $lastTool !== 'ticket') {
+                                $this->ticketTool->setConversationId($conversationId);
+                                // Executa a tool para popular conv:{id}:boletos e last_tool='ticket'
+                                $this->ticketTool->__invoke($storedCpf);
+                                Log::info('Ticket.fallback.invoked', ['conv' => $conversationId]);
+                            }
+                        } elseif ($currentIntent === 'card') {
+                            $storedCpf = $this->getStoredCpf($conversationId);
+                            $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
+                            $lastTool = Cache::get($lastToolKey);
+                            $loginOk = !$this->shouldShowLoginButton($conversationId, $kw);
+                            Log::info('Card.fallback.check', [
+                                'conv' => $conversationId,
+                                'has_cpf' => (bool) $storedCpf,
+                                'login_ok' => $loginOk,
+                                'last_tool' => $lastTool,
+                            ]);
+                            if ($storedCpf && strlen($storedCpf) === 11 && $loginOk && $lastTool !== 'card') {
+                                $this->cardTool->setConversationId($conversationId);
+                                $this->cardTool->setKw($kw);
+                                $this->cardTool->__invoke($storedCpf, $kw);
+                                Log::info('Card.fallback.invoked', ['conv' => $conversationId]);
+                            }
+                        } elseif ($currentIntent === 'ir') {
+                            $storedCpf = $this->getStoredCpf($conversationId);
+                            $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
+                            $lastTool = Cache::get($lastToolKey);
+                            $loginOk = !$this->shouldShowLoginButton($conversationId, $kw);
+                            Log::info('Ir.fallback.check', [
+                                'conv' => $conversationId,
+                                'has_cpf' => (bool) $storedCpf,
+                                'login_ok' => $loginOk,
+                                'last_tool' => $lastTool,
+                            ]);
+                            if ($storedCpf && strlen($storedCpf) === 11 && $loginOk && $lastTool !== 'ir') {
+                                $this->irInformTool->setConversationId($conversationId);
+                                $this->irInformTool->setKw($kw);
+                                $this->irInformTool->__invoke($storedCpf, null, $kw);
+                                Log::info('Ir.fallback.invoked', ['conv' => $conversationId]);
+                            }
+                        }
                     }
-                } elseif ($currentIntent === 'card') {
-                    $storedCpf = $this->getStoredCpf($conversationId);
-                    $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
-                    $lastTool = Cache::get($lastToolKey);
-                    $loginOk = !$this->shouldShowLoginButton($conversationId, $kw);
-                    Log::info('Card.fallback.check', [
-                        'conv' => $conversationId,
-                        'has_cpf' => (bool) $storedCpf,
-                        'login_ok' => $loginOk,
-                        'last_tool' => $lastTool,
-                    ]);
-                    if ($storedCpf && strlen($storedCpf) === 11 && $loginOk && $lastTool !== 'card') {
-                        $this->cardTool->setConversationId($conversationId);
-                        $this->cardTool->setKw($kw);
-                        $this->cardTool->__invoke($storedCpf, $kw);
-                        Log::info('Card.fallback.invoked', ['conv' => $conversationId]);
-                    }
-                } elseif ($currentIntent === 'ir') {
-                    $storedCpf = $this->getStoredCpf($conversationId);
-                    $lastToolKey = $this->getConversationCacheKey($conversationId, 'last_tool');
-                    $lastTool = Cache::get($lastToolKey);
-                    $loginOk = !$this->shouldShowLoginButton($conversationId, $kw);
-                    Log::info('Ir.fallback.check', [
-                        'conv' => $conversationId,
-                        'has_cpf' => (bool) $storedCpf,
-                        'login_ok' => $loginOk,
-                        'last_tool' => $lastTool,
-                    ]);
-                    if ($storedCpf && strlen($storedCpf) === 11 && $loginOk && $lastTool !== 'ir') {
-                        $this->irInformTool->setConversationId($conversationId);
-                        $this->irInformTool->setKw($kw);
-                        $this->irInformTool->__invoke($storedCpf, null, $kw);
-                        Log::info('Ir.fallback.invoked', ['conv' => $conversationId]);
-                    }
-                }
                 }
             } catch (\Throwable $e) {
                 Log::warning('Ticket fallback execution failed', ['error' => $e->getMessage()]);
@@ -579,10 +676,12 @@ class AIAssistantMultipleInputController extends Controller
                 'ticketError' => $ticketError,
                 'ticketErrorDetail' => $ticketErrorDetail,
                 'intentNow' => $intentForTurn ?? $this->getStoredIntent($conversationId),
+                'lastTool' => Cache::get($this->getConversationCacheKey($conversationId, 'last_tool')),
                 // Flags de turno com arquivo
                 'isFileTurn' => (bool) Cache::get($this->getConversationCacheKey($conversationId, 'is_file_turn')),
                 'fileKind' => Cache::get($this->getConversationCacheKey($conversationId, 'file_kind')),
                 'cpfExtractedThisTurn' => (bool) Cache::get($this->getConversationCacheKey($conversationId, 'cpf_extracted_this_turn')),
+                'imageErrorThisTurn' => (bool) Cache::get($this->getConversationCacheKey($conversationId, 'image_error_this_turn')),
             ])->render())
         ];
         //Log::info('PROMPT' , $messages);
@@ -720,13 +819,33 @@ class AIAssistantMultipleInputController extends Controller
         $lastTool = Cache::get($lastToolKey);
         $shouldShowLogin = $this->shouldShowLoginButton($conversationId, $kwInline);
         $intent = $this->getStoredIntent($conversationId);
+        $storedCpfNow = $this->getStoredCpf($conversationId);
         Log::info('Payload.build.start', [
             'conv' => $conversationId,
             'intent' => $intent,
             'last_tool' => $lastTool,
             'login_required' => $shouldShowLogin,
-            'has_cpf' => (bool) $this->getStoredCpf($conversationId),
+            'has_cpf' => (bool) $storedCpfNow,
         ]);
+        // Mensagem determinística quando houve erro de análise de imagem no turno
+        $imageErrorThisTurn = (bool) Cache::pull($this->getConversationCacheKey($conversationId, 'image_error_this_turn'));
+        if ($imageErrorThisTurn) {
+            // Só sobrepõe a resposta se nenhuma tool rodou efetivamente
+            if (!in_array($lastTool, ['ticket','card','ir'], true)) {
+                $payload['text'] = 'Não consegui processar o arquivo enviado. Por favor, informe o CPF (11 dígitos) e me diga o que deseja ver (boletos, carteirinha, planos, pagamentos, IR ou coparticipação).';
+                Log::info('Image.user_notice.failed', ['conv' => $conversationId]);
+            }
+        }
+        $isFileTurnPayload = (bool) Cache::get($this->getConversationCacheKey($conversationId, 'is_file_turn'));
+        $cpfFromThisTurnPayload = (bool) Cache::get($this->getConversationCacheKey($conversationId, 'cpf_extracted_this_turn'));
+        if ($intent === 'ticket' && $lastTool !== 'ticket' && $storedCpfNow && $isFileTurnPayload && $cpfFromThisTurnPayload) {
+            $payload['text'] = 'Recebi seu CPF e estou consultando seus boletos. Aguarde um instante, por favor.';
+            Log::info('Payload.ticket.defer_file_turn', [
+                'conv' => $conversationId,
+                'reason' => 'cpf_from_file_pending_tool',
+            ]);
+        }
+
         $payloadRequest = $this->getStoredPayloadRequest($conversationId);
         $requestedFields = array_values(array_unique(array_filter($payloadRequest['fields'] ?? [])));
         $contractFilters = $payloadRequest['contract_filters'] ?? [];
@@ -764,6 +883,10 @@ class AIAssistantMultipleInputController extends Controller
             if (is_array($tickets)) {
                 $payload['boletos'] = $tickets;
                 $payload['text'] = $this->adjustTicketText($payload['text'], $tickets);
+                Log::info('Payload.ticket.attached', [
+                    'conv' => $conversationId,
+                    'attached_count' => count($tickets),
+                ]);
             }
             Cache::forget($ticketsKey);
         } elseif ($lastTool === 'card') {
@@ -887,7 +1010,6 @@ class AIAssistantMultipleInputController extends Controller
         } else {
             // Reforço determinístico: para intenção 'ticket' sem CPF e sem execução da tool, peça CPF e não afirme "localizei".
             if ($intent === 'ticket') {
-                $storedCpfNow = $this->getStoredCpf($conversationId);
                 if (!$storedCpfNow) {
                     $payload['cpf_required'] = true;
                     // Decide saudação apenas se este for de fato o primeiro turno do assistente
@@ -906,6 +1028,16 @@ class AIAssistantMultipleInputController extends Controller
                     $base = 'Para consultar seus boletos, preciso do seu CPF (somente números), por favor.';
                     $payload['text'] = ($assistantTurns <= 1 ? ('Olá, ' . $greet . '! ') : '') . $base;
                     Log::info('Payload.ticket.enforce_cpf', ['conv' => $conversationId, 'assistant_turns' => $assistantTurns]);
+                    // Registra intenção pendente para ticket, aguardando CPF
+                    $pendingKey = $this->getConversationCacheKey($conversationId, 'pending_request');
+                    $pending = [
+                        'intent' => 'ticket',
+                        'fields' => [],
+                        'contract_filters' => [],
+                        'period_filters' => [],
+                        'user_text' => Cache::get($this->getConversationCacheKey($conversationId, 'last_user_text')),
+                    ];
+                    Cache::put($pendingKey, $pending, now()->endOfDay());
                 }
             }
 
@@ -924,37 +1056,15 @@ class AIAssistantMultipleInputController extends Controller
                 $payload['login'] = $shouldShowLogin;
 
                 if ($shouldShowLogin) {
-                    $text = $payload['text'] ?? '';
-
-                    if (
-                        $this->messageContradictsLogin($text) ||
-                        !$this->messageMentionsLogin($text) ||
-                        $this->messageAsksForCpf($text)
-                    ) {
-                        $payload['text'] = $this->buildLoginReminderMessage($conversationId, $requestedFields);
-                    } else {
-                        if ($assistantCount > 0) {
-                            $payload['text'] = $this->stripGreeting($payload['text'] ?? '');
-                            $payload['text'] = $this->stripFollowUp($payload['text'] ?? '');
-                        }
-                    }
+                    // Sempre padroniza a mensagem de login para card (carteirinha/planos/pagamentos/coparticipação)
+                    $payload['text'] = $this->buildLoginReminderMessage($conversationId, $requestedFields);
                 }
             } elseif ($intent === 'ir') {
                 $payload['login'] = $shouldShowLogin;
 
-                if (
-                    $shouldShowLogin && (
-                        $this->messageContradictsLogin($payload['text'] ?? '') ||
-                        !$this->messageMentionsLogin($payload['text'] ?? '') ||
-                        $this->messageAsksForCpf($payload['text'] ?? '')
-                    )
-                ) {
+                if ($shouldShowLogin) {
+                    // Sempre padroniza a mensagem de login para IR
                     $payload['text'] = $this->buildIrLoginReminderMessage();
-                } elseif ($shouldShowLogin) {
-                    if ($assistantCount > 0) {
-                        $payload['text'] = $this->stripGreeting($payload['text'] ?? '');
-                        $payload['text'] = $this->stripFollowUp($payload['text'] ?? '');
-                    }
                 }
             }
         }
@@ -994,7 +1104,47 @@ class AIAssistantMultipleInputController extends Controller
         Cache::forget($this->getConversationCacheKey($conversationId, 'ticket_error'));
         Cache::forget($this->getConversationCacheKey($conversationId, 'ticket_error_detail'));
 
+        // Sanitização final: evitar afirmações sem dados anexados
+        try {
+            $finalText = (string) ($payload['text'] ?? '');
+            $hasTicketData = !empty($payload['boletos']);
+            $hasAnyCardData = !empty($payload['beneficiarios']) || !empty($payload['planos']) || !empty($payload['fichafinanceira']) || !empty($payload['coparticipacao']);
+
+            if (!$hasTicketData && $this->textClaimsTicketResult($finalText)) {
+                Log::info('Payload.ticket.mismatch_between_text_and_data', ['conv' => $conversationId]);
+                $payload['text'] = $this->assistantMessages->withFollowUp('Posso ajudar com: boletos, carteirinha, planos, pagamentos, IR ou coparticipação. Qual você quer ver?');
+            }
+            if (!$hasAnyCardData && $this->textClaimsCardResult($finalText)) {
+                Log::info('Payload.card.mismatch_between_text_and_data', ['conv' => $conversationId]);
+                $payload['text'] = $this->assistantMessages->withFollowUp('Posso ajudar com: carteirinha, planos, pagamentos ou coparticipação. O que você deseja ver?');
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Payload.sanitizer.failed', ['error' => $e->getMessage()]);
+        }
+
         return $this->enforceCpfRequirement($payload, $conversationId, $intent, $requestedFields, $kwInline);
+    }
+
+    private function textClaimsTicketResult(string $text): bool
+    {
+        $t = Str::lower(Str::ascii(strip_tags($text)));
+        if ($t === '') return false;
+        $claims = (str_contains($t, 'localiz') || str_contains($t, 'encontrei') || str_contains($t, 'exibi') || str_contains($t, 'mostr'));
+        $domain = (str_contains($t, 'boleto') || str_contains($t, 'cobran'));
+        return $claims && $domain;
+    }
+
+    private function textClaimsCardResult(string $text): bool
+    {
+        $t = Str::lower(Str::ascii(strip_tags($text)));
+        if ($t === '') return false;
+        $domainWords = ['plano', 'planos', 'carteir', 'benefici', 'coparticip', 'pagament'];
+        $domain = false;
+        foreach ($domainWords as $w) {
+            if (str_contains($t, $w)) { $domain = true; break; }
+        }
+        $claims = (str_contains($t, 'localiz') || str_contains($t, 'encontrei') || str_contains($t, 'exibi') || str_contains($t, 'mostr'));
+        return $domain && $claims;
     }
 
     private function enforceCpfRequirement(array $payload, string $conversationId, ?string $intent, array $requestedFields, ?string $kwInline = null): array
@@ -1725,7 +1875,8 @@ class AIAssistantMultipleInputController extends Controller
         }
 
         if ($available > 0 && $unavailable === 0) {
-            return $originalText;
+            $message = 'Boletos localizados. Copie a linha digitável ou abra o PDF abaixo (link válido por 1 hora).';
+            return $this->assistantMessages->withFollowUp($message);
         }
 
         if ($available > 0 && $unavailable > 0) {
@@ -1740,7 +1891,8 @@ class AIAssistantMultipleInputController extends Controller
             );
         }
 
-        return $originalText;
+        $sanitized = $this->stripFollowUp($originalText ?? '');
+        return $this->assistantMessages->withFollowUp($sanitized !== '' ? $sanitized : 'Consulta concluída.');
     }
 
     private function adjustCardText(string $originalText, array $payload, array $requestedFields): string
@@ -1748,7 +1900,8 @@ class AIAssistantMultipleInputController extends Controller
         $fields = array_values(array_intersect($requestedFields, ['planos', 'fichafinanceira', 'coparticipacao', 'beneficiarios']));
 
         if (empty($fields)) {
-            return $originalText;
+            $sanitized = $this->stripFollowUp($originalText ?? '');
+            return $sanitized === '' ? $sanitized : $this->assistantMessages->withFollowUp($sanitized);
         }
 
         $messages = [];
@@ -1765,11 +1918,15 @@ class AIAssistantMultipleInputController extends Controller
                         } else {
                             $messages[] = $this->assistantMessages->cardNotFound('planos');
                         }
+                    } else {
+                        $messages[] = $this->getCardPositiveMessage('planos');
                     }
                     break;
                 case 'beneficiarios':
                     if ($this->isBeneficiariesEmpty($data)) {
                         $messages[] = $this->assistantMessages->cardNotFound('beneficiarios');
+                    } else {
+                        $messages[] = $this->getCardPositiveMessage('beneficiarios');
                     }
                     break;
                 case 'fichafinanceira':
@@ -1782,6 +1939,8 @@ class AIAssistantMultipleInputController extends Controller
                         }
                     } elseif ($emptyState === 'partial_empty') {
                         $messages[] = $this->assistantMessages->cardPartial('fichafinanceira');
+                    } else {
+                        $messages[] = $this->getCardPositiveMessage('fichafinanceira');
                     }
                     break;
                 case 'coparticipacao':
@@ -1794,6 +1953,8 @@ class AIAssistantMultipleInputController extends Controller
                         }
                     } elseif ($emptyState === 'partial_empty') {
                         $messages[] = $this->assistantMessages->cardPartial('coparticipacao');
+                    } else {
+                        $messages[] = $this->getCardPositiveMessage('coparticipacao');
                     }
                     break;
             }
@@ -1802,13 +1963,25 @@ class AIAssistantMultipleInputController extends Controller
         $messages = array_values(array_unique(array_filter($messages)));
 
         if (empty($messages)) {
-            return $originalText;
+            $sanitized = $this->stripFollowUp($originalText ?? '');
+            return $sanitized === '' ? $sanitized : $this->assistantMessages->withFollowUp($sanitized);
         }
 
         $lineBreak = (string) config('assistant.line_break', '<br>');
         $joined = implode($lineBreak, $messages);
 
         return $this->assistantMessages->withFollowUp($joined);
+    }
+
+    private function getCardPositiveMessage(string $field): string
+    {
+        return match ($field) {
+            'planos' => 'Planos localizados. Veja os detalhes abaixo.',
+            'beneficiarios' => 'Carteirinhas localizadas. Veja os detalhes abaixo.',
+            'fichafinanceira' => 'Pagamentos localizados. Veja os detalhes abaixo.',
+            'coparticipacao' => 'Coparticipações localizadas. Veja os detalhes abaixo.',
+            default => 'Consulta atualizada. Veja os detalhes abaixo.',
+        };
     }
 
     private function messageContradictsLogin(string $text): bool
@@ -1880,6 +2053,13 @@ class AIAssistantMultipleInputController extends Controller
             'precisa de algo mais',
             'posso ajudar com outra duvida',
             'posso ajudar com outra dúvida',
+            'precisa de outra consulta',
+            'quer que eu verifique mais alguma informacao',
+            'quer que eu verifique mais alguma informação',
+            'posso conferir outro dado',
+            'posso conferir outro dado para voce',
+            'posso conferir outro dado para você',
+            'posso ajudar em mais alguma consulta',
         ];
 
         foreach ($phrases as $p) {
