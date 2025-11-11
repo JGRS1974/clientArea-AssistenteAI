@@ -13,7 +13,10 @@
       "Trate mensagens elípticas usando o contexto recente (previous_intent, last_card_primary_field, last_requested_fields, recent_user_messages).",
       "Não invente parâmetro 'ano' para IR; se o usuário não especificar ano, a intenção ainda é 'ir'.",
       "Escolha apenas UMA intenção primária por vez.",
-      "Mantenha consistência de canal: no WhatsApp, as mensagens tendem a ser curtas e telegráficas; no web, mais formais."
+      "Mantenha consistência de canal: no WhatsApp, as mensagens tendem a ser curtas e telegráficas; no web, mais formais.",
+      "Mensagens fora do domínio (clima, notícias, política, religião, esportes, entretenimento/piadas, tecnologia/código, carreira/\"ganhar dinheiro\"/investimentos, vida pessoal etc.) devem retornar intent='unknown' e confidence <= 0.3.",
+      "Out-of-scope sempre prevalece sobre previous_intent/last_card_primary_field; não herde contexto quando o tema sair do domínio.",
+      "Se houver palavrões/ofensas, retorne intent='unknown' e confidence <= 0.2."
     ],
     "context": {
       "previous_intent": "{{ data_get($context ?? [], 'previous_intent') }}",
@@ -68,6 +71,14 @@
       {
         "input": "oi",
         "output": {"intent": "unknown", "confidence": 0.2, "slots": {}}
+      },
+      {
+        "input": "por favor quantos graus está fazendo lá fora",
+        "output": {"intent": "unknown", "confidence": 0.15, "slots": {}}
+      },
+      {
+        "input": "por favor me dê um conselho sobre como ganhar dinheiro",
+        "output": {"intent": "unknown", "confidence": 0.10, "slots": {}}
       }
     ]
   },
