@@ -894,7 +894,9 @@ class AIAssistantMultipleInputController extends Controller
                         // Fallback seguro se o LLM não retornar texto.
                         $sanitized = $this->assistantMessages->ticketNone();
                     }
-                    $payload['text'] = $this->assistantMessages->withFollowUp($sanitized);
+                    //Resposta do LLM com follow_up no final
+                    //$payload['text'] = $this->assistantMessages->withFollowUp($sanitized);
+                    $payload['text'] = $sanitized; //Só retorna a resposta do LLM
                 }
                 Log::info('Payload.ticket.attached', [
                     'conv' => $conversationId,
