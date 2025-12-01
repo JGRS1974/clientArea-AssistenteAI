@@ -1129,9 +1129,34 @@ class AIAssistantMultipleInputController extends Controller
     {
         $t = Str::lower(Str::ascii(strip_tags($text)));
         if ($t === '') return false;
-        $claims = (str_contains($t, 'localiz') || str_contains($t, 'encontrei') || str_contains($t, 'exibi') || str_contains($t, 'mostr'));
         $domain = (str_contains($t, 'boleto') || str_contains($t, 'cobran'));
-        return $claims && $domain;
+        if (!$domain) {
+            return false;
+        }
+
+        // Ignora frases claramente negativas sobre boletos,
+        // para não tratar "não encontrei boletos" como resultado positivo.
+        $hasNegativeNearDomain = (bool) preg_match(
+            '/\b(n[aã]o|nenhum|nenhuma|sem)\b[^\.]{0,80}\b(boleto|cobran)/u',
+            $t
+        );
+        $hasNegativeNearVerb = (bool) preg_match(
+            '/\b(n[aã]o)\s+(localiz\w*|encontr\w*|mostr\w*|exib\w*)/u',
+            $t
+        );
+
+        if ($hasNegativeNearDomain || $hasNegativeNearVerb) {
+            return false;
+        }
+
+        $claims = (
+            str_contains($t, 'localiz') ||
+            str_contains($t, 'encontrei') ||
+            str_contains($t, 'exibi') ||
+            str_contains($t, 'mostr')
+        );
+
+        return $claims;
     }
 
     private function textClaimsCardResult(string $text): bool
