@@ -20,8 +20,8 @@ return [
     ],
     'ticket' => [
         'none' => [
-            'Não encontrei boletos disponíveis no momento.',
-            'Não encontrei boletos em aberto para este CPF.',
+            'Não há boletos disponíveis no momento.',
+            'Não há boletos em aberto para este CPF.',
             'Nenhum boleto disponível no momento.',
             'Não há cobranças em aberto agora. Se preferir, posso conferir outro CPF.',
         ],
