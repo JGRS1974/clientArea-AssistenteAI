@@ -882,7 +882,20 @@ class AIAssistantMultipleInputController extends Controller
             $tickets = Cache::get($ticketsKey);
             if (is_array($tickets)) {
                 $payload['boletos'] = $tickets;
-                $payload['text'] = $this->adjustTicketText($payload['text'], $tickets);
+                if (!empty($tickets)) {
+                    // Há boletos disponíveis/vencidos: aplica lógica detalhada de ajuste.
+                    $payload['text'] = $this->adjustTicketText($payload['text'], $tickets);
+                } else {
+                    // Nenhum boleto retornado pela TicketTool: preserva a mensagem do LLM,
+                    // apenas garantindo o padrão de follow-up.
+                    $originalText = (string) ($payload['text'] ?? '');
+                    $sanitized = $this->stripFollowUp($originalText);
+                    if ($sanitized === '') {
+                        // Fallback seguro se o LLM não retornar texto.
+                        $sanitized = $this->assistantMessages->ticketNone();
+                    }
+                    $payload['text'] = $this->assistantMessages->withFollowUp($sanitized);
+                }
                 Log::info('Payload.ticket.attached', [
                     'conv' => $conversationId,
                     'attached_count' => count($tickets),
@@ -1107,10 +1120,14 @@ class AIAssistantMultipleInputController extends Controller
         // Sanitização final: evitar afirmações sem dados anexados
         try {
             $finalText = (string) ($payload['text'] ?? '');
-            $hasTicketData = !empty($payload['boletos']);
+            $hasTicketData = !empty($payload['boletos'] ?? null);
             $hasAnyCardData = !empty($payload['beneficiarios']) || !empty($payload['planos']) || !empty($payload['fichafinanceira']) || !empty($payload['coparticipacao']);
 
-            if (!$hasTicketData && $this->textClaimsTicketResult($finalText)) {
+            // Só aplica o fallback genérico de "boleto" quando não há dados
+            // e nenhuma execução da TicketTool populou o payload.
+            $ticketToolRan = array_key_exists('boletos', $payload);
+
+            if (!$hasTicketData && !$ticketToolRan && $this->textClaimsTicketResult($finalText)) {
                 Log::info('Payload.ticket.mismatch_between_text_and_data', ['conv' => $conversationId]);
                 $payload['text'] = $this->assistantMessages->withFollowUp('Posso ajudar com: boletos, carteirinha, planos, pagamentos, IR ou coparticipação. Qual você quer ver?');
             }
