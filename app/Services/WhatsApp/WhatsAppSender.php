@@ -46,8 +46,8 @@ class WhatsAppSender
         $token = env('EVOLUTION_API_KEY');
 
         //$url = sprintf('%s/v2/%s/message/send-audio', $base, $instance);
-        $url = sprintf('%s/message/sendAudio/%s', $base, $instance);
-
+        //$url = sprintf('%s/message/sendAudio/%s', $base, $instance);
+        $url = sprintf('%s/message/sendWhatsAppAudio/%s', $base, $instance);
         $payload = [
             'number' => $phone,
             'url' => $audioUrl,

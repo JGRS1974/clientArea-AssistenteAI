@@ -18,8 +18,34 @@ class EvolutionWebhookNormalizer
     {
         $fromMe = (bool) Arr::get($payload, 'data.key.fromMe', false);
 
+        $remoteJid = Arr::get($payload, 'data.key.remoteJid');
+        $remoteJidAlt = Arr::get($payload, 'data.key.remoteJidAlt');
+        $addressingMode = Arr::get($payload, 'data.key.addressingMode');
+
+        $chosenFrom = null;
+        $chosenFromSource = null;
+
+        // Quando o addressingMode for "lid", o remoteJid pode vir como "<id>@lid" (ex.: self-chat).
+        // Nesses casos, preferimos o remoteJidAlt quando disponível (ex.: "<e164>@s.whatsapp.net"),
+        // pois é o identificador que pode ser usado para enviar mensagens de volta.
+        $remoteJidStr = is_string($remoteJid) ? $remoteJid : '';
+        $isLid = ($remoteJidStr !== '' && Str::endsWith(Str::lower($remoteJidStr), '@lid'))
+            || (is_string($addressingMode) && Str::lower($addressingMode) === 'lid');
+
+        if ($isLid && is_string($remoteJidAlt) && trim($remoteJidAlt) !== '') {
+            $chosenFrom = $remoteJidAlt;
+            $chosenFromSource = 'data.key.remoteJidAlt';
+        } elseif ($isLid && $fromMe && is_string(Arr::get($payload, 'sender')) && trim((string) Arr::get($payload, 'sender')) !== '') {
+            // Fallback conservador para self-chat quando não há remoteJidAlt.
+            $chosenFrom = Arr::get($payload, 'sender');
+            $chosenFromSource = 'sender';
+        } else {
+            $chosenFrom = $remoteJid;
+            $chosenFromSource = 'data.key.remoteJid';
+        }
+
         // Prioriza o remoteJid (número do usuário) em vez de sender (número da instância)
-        $from = Arr::get($payload, 'data.key.remoteJid')
+        $from = $chosenFrom
             ?? Arr::get($payload, 'data.key.participant') // grupos não serão usados, mas mantém como fallback
             ?? Arr::get($payload, 'from')
             ?? Arr::get($payload, 'message.from')
@@ -34,8 +60,11 @@ class EvolutionWebhookNormalizer
             Log::info('Normalizer.phone', [
                 'event' => Arr::get($payload, 'event'),
                 'remoteJid' => Arr::get($payload, 'data.key.remoteJid'),
+                'remoteJidAlt' => Arr::get($payload, 'data.key.remoteJidAlt'),
+                'addressingMode' => Arr::get($payload, 'data.key.addressingMode'),
                 'participant' => Arr::get($payload, 'data.key.participant'),
                 'sender' => Arr::get($payload, 'sender'),
+                'chosen_from_source' => $chosenFromSource,
                 'chosen_from' => $from,
                 'phone' => $phone,
                 'from_me' => (bool) Arr::get($payload, 'data.key.fromMe', false),
