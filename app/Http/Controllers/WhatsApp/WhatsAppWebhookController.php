@@ -293,15 +293,7 @@ class WhatsAppWebhookController extends Controller
 
         $baseText = $payload['text'] ?? ($messages[0] ?? '');
         $cleanBaseText = trim(strip_tags(str_ireplace(['<br>', '<br/>', '<br />'], "\n", (string) $baseText)));
-
-        // Envia ao WhatsApp
-        if ($replyWithAudio && $cleanBaseText !== '') {
-            $audio = $this->tts->synthesize($cleanBaseText, $phone);
-            if ($audio && !empty($audio['url'])) {
-                $this->sender->sendAudioByUrl($phone, $audio['url'], true);
-                usleep(250000);
-            }
-        }
+        $shouldReplyWithAudio = ($replyWithAudio && $cleanBaseText !== '');
 
         // Gating de saída (para quem enviar) + whitelist
         $outAllowSelf = (bool) env('WA_OUTBOUND_ALLOW_SELF', false);
@@ -324,6 +316,28 @@ class WhatsAppWebhookController extends Controller
                 'whitelist' => $whitelist,
             ]);
             return response()->json(['ok' => true]);
+        }
+
+        // Se a entrada foi áudio, tenta responder somente com áudio (PTT).
+        // Se falhar (ex.: erro no TTS ou no envio), cai no fluxo de texto como fallback.
+        if ($shouldReplyWithAudio) {
+            $audio = $this->tts->synthesize($cleanBaseText, $phone);
+            if ($audio && !empty($audio['url'])) {
+                $result = $this->sender->sendAudioByUrl($phone, $audio['url'], true);
+                $sent = (bool) ($result['success'] ?? false);
+                Log::info('sendWhatsAppAudio result', [
+                    'to' => $phone,
+                    'success' => $sent,
+                    'httpcode' => $result['httpcode'] ?? null,
+                ]);
+                if ($sent) {
+                    return response()->json(['ok' => true, 'audio_only' => true]);
+                }
+            } else {
+                Log::info('sendWhatsAppAudio skipped: TTS not available', [
+                    'to' => $phone,
+                ]);
+            }
         }
 
         // TTL para anti-loop de eco de texto
