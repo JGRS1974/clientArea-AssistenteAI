@@ -50,7 +50,7 @@ class WhatsAppSender
         $url = sprintf('%s/message/sendWhatsAppAudio/%s', $base, $instance);
         $payload = [
             'number' => $phone,
-            'url' => $audioUrl,
+            'audio' => $audioUrl,
             'ptt' => $asPtt,
         ];
 
