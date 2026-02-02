@@ -318,7 +318,7 @@ class WhatsAppWebhookController extends Controller
             return response()->json(['ok' => true]);
         }
 
-        // Se a entrada foi áudio, tenta responder somente com áudio (PTT).
+        // Se a entrada foi áudio, tenta responder somente com áudio (PTT)..
         // Se falhar (ex.: erro no TTS ou no envio), cai no fluxo de texto como fallback.
         if ($shouldReplyWithAudio) {
             $audio = $this->tts->synthesize($cleanBaseText, $phone);

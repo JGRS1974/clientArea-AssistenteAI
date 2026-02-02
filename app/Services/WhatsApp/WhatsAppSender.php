@@ -36,7 +36,7 @@ class WhatsAppSender
     }
 
     /**
-     * Envia um áudio (ex.: TTS gerado pelo backend) via Evolution API.
+     * Envia um áudio (ex.: TTS gerado pelo backend) via Evolution API..
      * $audioUrl deve apontar para um arquivo acessível publicamente.
      */
     public function sendAudioByUrl(string $phone, string $audioUrl, bool $asPtt = true): array
