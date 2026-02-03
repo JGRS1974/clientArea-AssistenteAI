@@ -40,6 +40,88 @@ class WhatsAppWebhookController extends Controller
     {
 
         $webhook = $request->all();
+
+        // -----------------------------
+        // Idempotência (dedupe webhook)
+        // -----------------------------
+        // A Evolution pode reenviar o mesmo evento (mesmo data.key.id) quando há timeout/erro no webhook.
+        // Implementação em 2 fases:
+        //  - processing: TTL curto (anti "tempestade" durante retries enquanto processa)
+        //  - done: TTL longo (não reprocessar após concluir)
+        $event = (string) data_get($webhook, 'event', '');
+        $dedupeDoneTtl = (int) env('WA_WEBHOOK_DEDUPE_DONE_TTL_SECONDS', 3600);
+        $dedupeProcessingTtl = (int) env('WA_WEBHOOK_DEDUPE_PROCESSING_TTL_SECONDS', 300);
+        $dedupeEnabled = ($dedupeDoneTtl > 0 || $dedupeProcessingTtl > 0);
+
+        $dedupeKeys = null;
+        if ($dedupeEnabled) {
+            $messageId = (string) data_get($webhook, 'data.key.id', '');
+            $remoteJidAlt = (string) data_get($webhook, 'data.key.remoteJidAlt', '');
+            $remoteJid = (string) data_get($webhook, 'data.key.remoteJid', '');
+            $chatKey = $remoteJidAlt !== '' ? $remoteJidAlt : $remoteJid;
+            $instance = (string) (data_get($webhook, 'instance') ?: env('EVOLUTION_INSTANCE', ''));
+
+            // Só deduplica quando há identificador confiável
+            if ($messageId !== '' && $chatKey !== '') {
+                $base = 'wa:evo:' . ($instance !== '' ? $instance : 'unknown') . ':' . $chatKey . ':' . $messageId;
+                $keyProcessing = $base . ':processing';
+                $keyDone = $base . ':done';
+
+                $dedupeKeys = [
+                    'processing' => $keyProcessing,
+                    'done' => $keyDone,
+                    'meta' => [
+                        'event' => $event,
+                        'instance' => $instance,
+                        'chatKey' => $chatKey,
+                        'messageId' => $messageId,
+                        'processing_ttl' => $dedupeProcessingTtl,
+                        'done_ttl' => $dedupeDoneTtl,
+                    ],
+                ];
+
+                // Se já concluímos esse messageId recentemente, ignore
+                if ($dedupeDoneTtl > 0 && Cache::has($keyDone)) {
+                    Log::info('Duplicate webhook ignored (done)', $dedupeKeys['meta']);
+                    return response()->json(['ok' => true, 'duplicate' => true, 'state' => 'done']);
+                }
+
+                // Se alguém já está processando (ou acabamos de marcar), ignore para evitar reentrada
+                if ($dedupeProcessingTtl > 0) {
+                    if (!Cache::add($keyProcessing, 1, $dedupeProcessingTtl)) {
+                        Log::info('Duplicate webhook ignored (processing)', $dedupeKeys['meta']);
+                        return response()->json(['ok' => true, 'duplicate' => true, 'state' => 'processing']);
+                    }
+                }
+            }
+        }
+
+        $dedupeFinalize = function (string $state = 'done') use (&$dedupeKeys, $dedupeDoneTtl): void {
+            if (!is_array($dedupeKeys)) {
+                return;
+            }
+            if ($state === 'done' && isset($dedupeKeys['done']) && is_string($dedupeKeys['done']) && $dedupeDoneTtl > 0) {
+                Cache::put($dedupeKeys['done'], 1, $dedupeDoneTtl);
+            }
+            if (isset($dedupeKeys['processing']) && is_string($dedupeKeys['processing'])) {
+                Cache::forget($dedupeKeys['processing']);
+            }
+        };
+
+        $dedupeReturn = function (array $payload, int $status = 200) use ($dedupeFinalize) {
+            // Mesmo em retornos antecipados, marque como "visto" para não reprocessar retries.
+            $dedupeFinalize('done');
+            return response()->json($payload, $status);
+        };
+
+        $onlyUpsert = filter_var(env('WA_WEBHOOK_PROCESS_ONLY_UPSERT', true), FILTER_VALIDATE_BOOLEAN);
+        if ($onlyUpsert && $event !== '' && $event !== 'messages.upsert') {
+            Log::info('Webhook ignored by event filter', [
+                'event' => $event,
+                'messageType' => data_get($webhook, 'data.messageType') ?? ($webhook['messageType'] ?? null),
+            ]);
+            return $dedupeReturn(['ok' => true, 'ignored_event' => $event]);
+        }
         // Sanitiza logs para evitar despejar Base64 e payloads gigantes
         $meta = [
             'event' => $webhook['event'] ?? null,
@@ -95,7 +177,7 @@ class WhatsAppWebhookController extends Controller
                     $cooldown = (int) env('MAINTENANCE_COOLDOWN_SECONDS', 600);
                     $coolKey = 'wa:maint:last:' . ($num ?: 'unknown');
                     if ($cooldown > 0 && \Illuminate\Support\Facades\Cache::get($coolKey)) {
-                        return response()->json(['ok' => true, 'maintenance' => true, 'skipped_by_cooldown' => true]);
+                        return $dedupeReturn(['ok' => true, 'maintenance' => true, 'skipped_by_cooldown' => true]);
                     }
 
                     $msg = $this->buildMaintenanceMessage('whatsapp');
@@ -105,7 +187,7 @@ class WhatsAppWebhookController extends Controller
                             \Illuminate\Support\Facades\Cache::put($coolKey, 1, $cooldown);
                         }
                     }
-                    return response()->json(['ok' => true, 'maintenance' => true]);
+                    return $dedupeReturn(['ok' => true, 'maintenance' => true]);
                 }
             }
         } catch (\Throwable $e) {
@@ -142,7 +224,7 @@ class WhatsAppWebhookController extends Controller
                     Log::info('Inbound self-chat text skipped by cooldown anti-loop', [
                         'phone' => $phoneKey,
                     ]);
-                    return response()->json(['ok' => true]);
+                    return $dedupeReturn(['ok' => true, 'skipped' => true, 'reason' => 'self_text_cooldown']);
                 }
             }
         }
@@ -157,13 +239,13 @@ class WhatsAppWebhookController extends Controller
                 'self_media_only' => $selfMediaOnly,
                 'others_media_only' => $othersMediaOnly,
             ]);
-            return response()->json(['ok' => true]);
+            return $dedupeReturn(['ok' => true, 'skipped' => true, 'reason' => 'inbound_gating']);
         }
 
         $conversationId = $this->canonicalConversations->resolveForPhone($phone) ?? $phone;
         if ($phone === '') {
             Log::warning('WhatsApp webhook sem phone', $webhook);
-            return response()->json(['ok' => true]);
+            return $dedupeReturn(['ok' => true, 'skipped' => true, 'reason' => 'missing_phone']);
         }
 
         $replyWithAudio = (($normalized['media']['type'] ?? null) === 'audio');
@@ -315,7 +397,7 @@ class WhatsAppWebhookController extends Controller
                 'out_allow_others' => $outAllowOthers,
                 'whitelist' => $whitelist,
             ]);
-            return response()->json(['ok' => true]);
+            return $dedupeReturn(['ok' => true, 'skipped' => true, 'reason' => 'outbound_gating']);
         }
 
         // Se a entrada foi áudio, tenta responder somente com áudio (PTT)..
@@ -331,7 +413,7 @@ class WhatsAppWebhookController extends Controller
                     'httpcode' => $result['httpcode'] ?? null,
                 ]);
                 if ($sent) {
-                    return response()->json(['ok' => true, 'audio_only' => true]);
+                    return $dedupeReturn(['ok' => true, 'audio_only' => true]);
                 }
             } else {
                 Log::info('sendWhatsAppAudio skipped: TTS not available', [
@@ -371,6 +453,7 @@ class WhatsAppWebhookController extends Controller
             usleep(200000);
         }
 
+        $dedupeFinalize('done');
         return response()->json(['ok' => true]);
     }
 
