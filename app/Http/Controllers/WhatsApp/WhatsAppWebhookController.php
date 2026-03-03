@@ -19,17 +19,36 @@ use Symfony\Component\HttpFoundation\File\UploadedFile;
 
 class WhatsAppWebhookController extends Controller
 {
+    private EvolutionWebhookNormalizer $normalizer;
+    private KwCacheRepository $kwRepo;
+    private LoginLinkService $loginLinks;
+    private CanonicalConversationService $canonicalConversations;
+    private RedisConversationService $redisConversations;
+    private TextToSpeechService $tts;
+    private MessageChunker $chunker;
+    private WhatsAppMessageFormatter $formatter;
+    private WhatsAppSender $sender;
+
     public function __construct(
-        private EvolutionWebhookNormalizer $normalizer,
-        private KwCacheRepository $kwRepo,
-        private LoginLinkService $loginLinks,
-        private CanonicalConversationService $canonicalConversations,
-        private RedisConversationService $redisConversations,
-        private TextToSpeechService $tts,
-        private MessageChunker $chunker,
-        private WhatsAppMessageFormatter $formatter,
-        private WhatsAppSender $sender,
+        EvolutionWebhookNormalizer $normalizer,
+        KwCacheRepository $kwRepo,
+        LoginLinkService $loginLinks,
+        CanonicalConversationService $canonicalConversations,
+        RedisConversationService $redisConversations,
+        TextToSpeechService $tts,
+        MessageChunker $chunker,
+        WhatsAppMessageFormatter $formatter,
+        WhatsAppSender $sender
     ) {
+        $this->normalizer = $normalizer;
+        $this->kwRepo = $kwRepo;
+        $this->loginLinks = $loginLinks;
+        $this->canonicalConversations = $canonicalConversations;
+        $this->redisConversations = $redisConversations;
+        $this->tts = $tts;
+        $this->chunker = $chunker;
+        $this->formatter = $formatter;
+        $this->sender = $sender;
     }
 
     /**
@@ -115,13 +134,23 @@ class WhatsAppWebhookController extends Controller
         };
 
         $onlyUpsert = filter_var(env('WA_WEBHOOK_PROCESS_ONLY_UPSERT', true), FILTER_VALIDATE_BOOLEAN);
-        if ($onlyUpsert && $event !== '' && $event !== 'messages.upsert') {
+        $eventNorm = strtolower(trim($event));
+        $isUpsertEvent = ($eventNorm === '' || $eventNorm === 'messages.upsert');
+        $isTrackingEvent = $this->isEvolutionTrackingEvent($eventNorm);
+
+        if ($onlyUpsert && $eventNorm !== '' && !$isUpsertEvent && !$isTrackingEvent) {
             Log::info('Webhook ignored by event filter', [
                 'event' => $event,
                 'messageType' => data_get($webhook, 'data.messageType') ?? ($webhook['messageType'] ?? null),
             ]);
             return $dedupeReturn(['ok' => true, 'ignored_event' => $event]);
         }
+
+        // Eventos de tracking (envio/status) não devem disparar pipeline do /api/chat.
+        if ($isTrackingEvent) {
+            return $this->handleEvolutionTrackingEvent($webhook, $dedupeReturn);
+        }
+
         // Sanitiza logs para evitar despejar Base64 e payloads gigantes
         $meta = [
             'event' => $webhook['event'] ?? null,
@@ -254,6 +283,15 @@ class WhatsAppWebhookController extends Controller
             $replyWithAudio = false;
         }
         $kw = $this->kwRepo->get($conversationId);
+
+        // Presença de "processando" (best effort). Evita sensação de travamento sem enviar mensagem.
+        if ($replyWithAudio) {
+            try {
+                $this->sender->sendPresence($phone, 'composing', (int) env('WA_AUDIO_PRESENCE_DELAY_MS', 20000));
+            } catch (\Throwable $e) {
+                // ignora falha de presença
+            }
+        }
 
         // Monta chamada interna ao endpoint /api/chat
         $chatUri = url('/api/chat');
@@ -401,20 +439,57 @@ class WhatsAppWebhookController extends Controller
         }
 
         // Se a entrada foi áudio, tenta responder somente com áudio (PTT)..
-        // Se falhar (ex.: erro no TTS ou no envio), cai no fluxo de texto como fallback.
+        // Se falhar, pode cair no fluxo de texto como fallback. Porém, em caso de timeout no envio
+        // do áudio, tratamos como estado "indeterminado" (o Evolution pode enviar mesmo assim).
         if ($shouldReplyWithAudio) {
             $audio = $this->tts->synthesize($cleanBaseText, $phone);
             if ($audio && !empty($audio['url'])) {
+                $pendingTtl = (int) env('WA_OUT_AUDIO_PENDING_TTL_SECONDS', 600);
+                $pendingKey = $this->pendingOutAudioKey($phone);
+                $pending = [
+                    'phone' => $phone,
+                    'created_at' => now()->timestamp,
+                    'audio_text' => $cleanBaseText,
+                    'followup_messages' => $this->filterPostAudioMessages($messages),
+                    'followup_sent' => false,
+                    'message_id' => null,
+                ];
+                if ($pendingTtl > 0) {
+                    Cache::put($pendingKey, $pending, now()->addSeconds($pendingTtl));
+                }
+
                 $result = $this->sender->sendAudioByUrl($phone, $audio['url'], true);
                 $sent = (bool) ($result['success'] ?? false);
+                $messageId = data_get($result, 'result.key.id') ?: data_get($result, 'result.key.id', null);
+                if (is_string($messageId) && $messageId !== '' && $pendingTtl > 0) {
+                    Cache::put($this->pendingOutAudioByMsgIdKey($messageId), $phone, now()->addSeconds($pendingTtl));
+                    $pending['message_id'] = $messageId;
+                    Cache::put($pendingKey, $pending, now()->addSeconds($pendingTtl));
+                }
                 Log::info('sendWhatsAppAudio result', [
                     'to' => $phone,
                     'success' => $sent,
                     'httpcode' => $result['httpcode'] ?? null,
+                    'error_type' => $result['error_type'] ?? null,
                 ]);
                 if ($sent) {
-                    return $dedupeReturn(['ok' => true, 'audio_only' => true]);
+                    $delayMs = (int) env('WA_AUDIO_FOLLOWUP_DELAY_MS', 2500);
+                    if ($delayMs > 0) {
+                        usleep(min($delayMs, 15000) * 1000);
+                    }
+
+                    $this->sendFollowUpForPendingAudio($phone);
+                    return $dedupeReturn(['ok' => true, 'audio_sent' => true, 'followup' => true]);
                 }
+
+                // Timeout do cURL: o Evolution pode enviar o áudio mesmo assim.
+                // Não dispare fallback de texto imediatamente para evitar "texto antes do áudio".
+                if (($result['error_type'] ?? null) === 'timeout') {
+                    return $dedupeReturn(['ok' => true, 'audio_pending' => true, 'reason' => 'audio_send_timeout']);
+                }
+
+                // Falha real: remove pendência para não disparar follow-up indevido.
+                Cache::forget($pendingKey);
             } else {
                 Log::info('sendWhatsAppAudio skipped: TTS not available', [
                     'to' => $phone,
@@ -582,21 +657,33 @@ class WhatsAppWebhookController extends Controller
     {
         if (!$mime) return null;
         $mime = trim(strtolower(strtok($mime, ';'))); // remove sufixos
-
-        return match ($mime) {
-            'audio/mpeg', 'audio/mp3' => 'mp3',
-            'audio/ogg' => 'ogg',
-            'audio/webm' => 'webm',
-            'audio/wav', 'audio/x-wav', 'audio/wave' => 'wav',
-            'audio/m4a', 'audio/x-m4a' => 'm4a',
-            'audio/aac' => 'aac',
-
-            'image/jpeg', 'image/jpg' => 'jpg',
-            'image/png' => 'png',
-            'application/pdf' => 'pdf',
-
-            default => null,
-        };
+        switch ($mime) {
+            case 'audio/mpeg':
+            case 'audio/mp3':
+                return 'mp3';
+            case 'audio/ogg':
+                return 'ogg';
+            case 'audio/webm':
+                return 'webm';
+            case 'audio/wav':
+            case 'audio/x-wav':
+            case 'audio/wave':
+                return 'wav';
+            case 'audio/m4a':
+            case 'audio/x-m4a':
+                return 'm4a';
+            case 'audio/aac':
+                return 'aac';
+            case 'image/jpeg':
+            case 'image/jpg':
+                return 'jpg';
+            case 'image/png':
+                return 'png';
+            case 'application/pdf':
+                return 'pdf';
+            default:
+                return null;
+        }
     }
 
     private function parseButtonInstruction(string $message): array
@@ -607,6 +694,340 @@ class WhatsAppWebhookController extends Controller
         }
 
         return [null, null];
+    }
+
+    // ==========================================
+    // Evolution tracking helpers (outgoing áudio)
+    // ==========================================
+    private function isEvolutionTrackingEvent(string $eventNorm): bool
+    {
+        if ($eventNorm === '') {
+            return false;
+        }
+
+        // Nomes comuns no webhook (v1) e equivalentes do v2 (varia por provider).
+        if ($eventNorm === 'messages.update' || $eventNorm === 'message.update' || $eventNorm === 'messages_update') {
+            return true;
+        }
+        if ($eventNorm === 'send.message' || $eventNorm === 'send_message' || $eventNorm === 'sendmessage') {
+            return true;
+        }
+
+        return str_contains($eventNorm, 'messages.update')
+            || str_contains($eventNorm, 'messages_update')
+            || str_contains($eventNorm, 'send.message')
+            || str_contains($eventNorm, 'send_message');
+    }
+
+    private function pendingOutAudioKey(string $phone): string
+    {
+        $digits = preg_replace('/\D/', '', $phone) ?: 'unknown';
+        return 'wa:out_audio_pending:' . $digits;
+    }
+
+    private function pendingOutAudioByMsgIdKey(string $messageId): string
+    {
+        return 'wa:out_audio_pending_by_msgid:' . $messageId;
+    }
+
+    private function extractDigitsFromRemoteJid(string $remoteJid): string
+    {
+        return preg_replace('/\D/', '', $remoteJid) ?: '';
+    }
+
+    private function isWebhookAudioMessage(array $webhook): bool
+    {
+        $type = strtolower(trim((string) (data_get($webhook, 'data.messageType')
+            ?? data_get($webhook, 'messageType')
+            ?? data_get($webhook, 'type')
+            ?? '')));
+
+        if ($type !== '' && str_contains($type, 'audio')) {
+            return true;
+        }
+
+        return (bool) (data_get($webhook, 'data.message.audioMessage')
+            ?? data_get($webhook, 'message.audioMessage')
+            ?? data_get($webhook, 'data.message.audio')
+            ?? data_get($webhook, 'message.audio'));
+    }
+
+    private function extractMessageStatusFromTrackingWebhook(array $webhook): ?string
+    {
+        $candidates = [
+            data_get($webhook, 'data.update.status'),
+            data_get($webhook, 'data.update.messageStatus'),
+            data_get($webhook, 'data.status'),
+            data_get($webhook, 'status'),
+        ];
+
+        foreach ($candidates as $v) {
+            if (is_string($v) && trim($v) !== '') {
+                return strtoupper(trim($v));
+            }
+        }
+
+        $update = data_get($webhook, 'data.update');
+        if (is_array($update)) {
+            foreach (['status', 'messageStatus'] as $k) {
+                if (isset($update[$k]) && is_string($update[$k]) && trim($update[$k]) !== '') {
+                    return strtoupper(trim($update[$k]));
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function findMessageListFromEvolutionResult(array $result): array
+    {
+        $root = $result['result'] ?? null;
+        if (!is_array($root)) {
+            return [];
+        }
+
+        foreach (['response', 'messages', 'data', 'result'] as $k) {
+            if (isset($root[$k]) && is_array($root[$k])) {
+                return $root[$k];
+            }
+        }
+
+        $isList = array_keys($root) === range(0, count($root) - 1);
+        return $isList ? $root : [];
+    }
+
+    private function confirmOutgoingAudioMessageId(string $remoteJid, string $messageId): bool
+    {
+        if ($remoteJid === '' || $messageId === '') {
+            return false;
+        }
+
+        try {
+            $res = $this->sender->findMessages($remoteJid, 10);
+            if (!(bool) ($res['success'] ?? false)) {
+                return false;
+            }
+            $list = $this->findMessageListFromEvolutionResult($res);
+            foreach ($list as $msg) {
+                if (!is_array($msg)) {
+                    continue;
+                }
+                $id = (string) (data_get($msg, 'key.id') ?? '');
+                $fromMe = (bool) (data_get($msg, 'key.fromMe') ?? false);
+                if ($id !== $messageId || !$fromMe) {
+                    continue;
+                }
+
+                $type = strtolower((string) (data_get($msg, 'messageType') ?? ''));
+                $hasAudio = (bool) (data_get($msg, 'message.audioMessage') ?? data_get($msg, 'message.audio'));
+                if ($hasAudio || ($type !== '' && str_contains($type, 'audio'))) {
+                    return true;
+                }
+            }
+        } catch (\Throwable $e) {
+            return false;
+        }
+
+        return false;
+    }
+
+    private function handleEvolutionTrackingEvent(array $webhook, \Closure $dedupeReturn)
+    {
+        $fromMe = (bool) (data_get($webhook, 'data.key.fromMe')
+            ?? data_get($webhook, 'key.fromMe')
+            ?? false);
+
+        if (!$fromMe) {
+            return $dedupeReturn(['ok' => true, 'tracking' => true, 'ignored' => true, 'reason' => 'not_from_me']);
+        }
+
+        $remoteJid = (string) (data_get($webhook, 'data.key.remoteJid')
+            ?? data_get($webhook, 'key.remoteJid')
+            ?? '');
+
+        $phone = $this->extractDigitsFromRemoteJid($remoteJid);
+        if ($phone === '') {
+            return $dedupeReturn(['ok' => true, 'tracking' => true, 'ignored' => true, 'reason' => 'missing_remoteJid']);
+        }
+
+        $eventNorm = strtolower(trim((string) (data_get($webhook, 'event') ?? ($webhook['event'] ?? ''))));
+
+        $pendingTtl = (int) env('WA_OUT_AUDIO_PENDING_TTL_SECONDS', 600);
+        $messageId = (string) (data_get($webhook, 'data.key.id') ?? data_get($webhook, 'key.id') ?? '');
+        if ($messageId !== '' && $pendingTtl > 0) {
+            $mappedPhone = Cache::get($this->pendingOutAudioByMsgIdKey($messageId));
+            if (is_string($mappedPhone) && $mappedPhone !== '') {
+                $phone = $mappedPhone;
+            }
+        }
+
+        $pendingKey = $this->pendingOutAudioKey($phone);
+        $pending = Cache::get($pendingKey);
+        if (!is_array($pending)) {
+            return $dedupeReturn(['ok' => true, 'tracking' => true, 'ignored' => true, 'reason' => 'no_pending_audio']);
+        }
+
+        $webhookSaysAudio = $this->isWebhookAudioMessage($webhook);
+        $status = $this->extractMessageStatusFromTrackingWebhook($webhook);
+        $isAck = ($status !== null && $status !== 'PENDING');
+
+        $pendingMsgId = isset($pending['message_id']) && is_string($pending['message_id']) ? $pending['message_id'] : null;
+        $messageMatchesPending = ($pendingMsgId !== null && $pendingMsgId !== '' && $messageId !== '' && $pendingMsgId === $messageId);
+
+        $shouldTrigger = false;
+        if ($webhookSaysAudio) {
+            $shouldTrigger = true;
+        } elseif ($messageMatchesPending && ($isAck || str_contains($eventNorm, 'messages'))) {
+            $shouldTrigger = true;
+        } elseif (($pendingMsgId === null || $pendingMsgId === '') && $messageId !== '' && $isAck) {
+            // Caso clássico: timeout no sendWhatsAppAudio e só recebemos updates sem payload de áudio.
+            if ($this->confirmOutgoingAudioMessageId($remoteJid, $messageId)) {
+                $shouldTrigger = true;
+                $pending['message_id'] = $messageId;
+                if ($pendingTtl > 0) {
+                    Cache::put($pendingKey, $pending, now()->addSeconds($pendingTtl));
+                    Cache::put($this->pendingOutAudioByMsgIdKey($messageId), $phone, now()->addSeconds($pendingTtl));
+                }
+            }
+        }
+
+        if (!$shouldTrigger) {
+            return $dedupeReturn([
+                'ok' => true,
+                'tracking' => true,
+                'ignored' => true,
+                'reason' => 'not_confirmed',
+                'status' => $status,
+                'message_id' => $messageId !== '' ? $messageId : null,
+            ]);
+        }
+
+        if ($messageId !== '' && $pendingTtl > 0) {
+            Cache::put($this->pendingOutAudioByMsgIdKey($messageId), $phone, now()->addSeconds($pendingTtl));
+        }
+
+        $delayMs = (int) env('WA_AUDIO_FOLLOWUP_DELAY_MS', 2500);
+        if ($delayMs > 0) {
+            usleep(min($delayMs, 15000) * 1000);
+        }
+
+        $sent = $this->sendFollowUpForPendingAudio($phone);
+        return $dedupeReturn([
+            'ok' => true,
+            'tracking' => true,
+            'followup_sent' => $sent,
+            'phone' => $phone,
+            'message_id' => $messageId !== '' ? $messageId : null,
+        ]);
+    }
+
+    private function filterPostAudioMessages(array $messages): array
+    {
+        $out = [];
+
+        foreach ($messages as $msg) {
+            if (!is_string($msg)) {
+                continue;
+            }
+            $text = trim($msg);
+            if ($text === '') {
+                continue;
+            }
+
+            if (str_starts_with($text, '__BUTTON__|')) {
+                $out[] = $text;
+                continue;
+            }
+
+            // URLs e instruções relacionadas a PDF (acionáveis)
+            if (preg_match('~https?://~i', $text)) {
+                $out[] = $text;
+                continue;
+            }
+            if (stripos($text, 'pdf') !== false && (stripos($text, 'clique') !== false || stripos($text, 'link') !== false)) {
+                $out[] = $text;
+                continue;
+            }
+
+            // Linha digitável / boleto (heurística)
+            if (preg_match('/\d{5}\.\d{5}\s+\d{5}\.\d{6}\s+\d{5}\.\d{6}\s+\d\s+\d{11,14}/', $text)) {
+                $out[] = $text;
+                continue;
+            }
+            if (preg_match('/^\d[\d\s\.\-]{30,}$/', $text)) {
+                $out[] = $text;
+                continue;
+            }
+
+            // Dados curtos e acionáveis do boleto
+            if (stripos($text, 'venc') !== false || stripos($text, 'valor') !== false || stripos($text, 'linha digit') !== false) {
+                $out[] = $text;
+                continue;
+            }
+        }
+
+        // Remove duplicatas preservando ordem
+        $seen = [];
+        $unique = [];
+        foreach ($out as $t) {
+            $k = md5($t);
+            if (isset($seen[$k])) continue;
+            $seen[$k] = true;
+            $unique[] = $t;
+        }
+
+        return $unique;
+    }
+
+    private function sendFollowUpForPendingAudio(string $phone): bool
+    {
+        $pendingKey = $this->pendingOutAudioKey($phone);
+        $pending = Cache::get($pendingKey);
+        if (!is_array($pending)) {
+            return false;
+        }
+
+        $createdAt = (int) ($pending['created_at'] ?? 0);
+        $doneKey = 'wa:out_audio_followup_done:' . preg_replace('/\D/', '', $phone) . ':' . ($createdAt ?: '0');
+        if (Cache::has($doneKey)) {
+            return false;
+        }
+
+        $followup = $pending['followup_messages'] ?? [];
+        if (!is_array($followup) || empty($followup)) {
+            // Nada a enviar: considere concluído e remova pendência.
+            Cache::put($doneKey, 1, now()->addSeconds((int) env('WA_OUT_AUDIO_PENDING_TTL_SECONDS', 600)));
+            Cache::forget($pendingKey);
+            return false;
+        }
+
+        $cooldown = (int) env('WA_ANTI_LOOP_FROMME_TEXT_COOLDOWN_SECONDS', 0);
+        foreach ($followup as $msg) {
+            if (is_string($msg) && str_starts_with($msg, '__BUTTON__|')) {
+                [$title, $url] = $this->parseButtonInstruction($msg);
+                if ($title !== null && $url !== null) {
+                    $buttons = [[
+                        'title' => 'Clique para abrir o PDF:',
+                        'url' => $url,
+                    ]];
+                    $this->sender->sendButton($phone, 'Clique para abrir o PDF:', $buttons);
+                    usleep(200000);
+                    continue;
+                }
+            }
+
+            $this->sender->sendText($phone, (string) $msg);
+
+            if ($cooldown > 0 && is_string($msg) && trim($msg) !== '') {
+                $hashKey = 'wa:last_outgoing_text_hash:' . ($phone ?: 'unknown');
+                Cache::put($hashKey, md5($msg), $cooldown);
+            }
+            usleep(200000);
+        }
+
+        Cache::put($doneKey, 1, now()->addSeconds((int) env('WA_OUT_AUDIO_PENDING_TTL_SECONDS', 600)));
+        Cache::forget($pendingKey);
+        return true;
     }
 
     // ============================

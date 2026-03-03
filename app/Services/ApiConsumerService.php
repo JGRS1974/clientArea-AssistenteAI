@@ -57,9 +57,22 @@ class ApiConsumerService
             $httpcode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
             $responseTime = round(($endTime - $startTime), 4);
             $error = curl_error($curl);
+            $errno = function_exists('curl_errno') ? curl_errno($curl) : null;
             $curlInfo = curl_getinfo($curl);
 
             curl_close($curl);
+
+            $errorType = null;
+            if (is_int($errno) && $errno !== 0) {
+                // Classificação simples para tratarmos timeouts de forma diferente do resto.
+                $isTimeoutErrno = (defined('CURLE_OPERATION_TIMEDOUT') && $errno === \CURLE_OPERATION_TIMEDOUT);
+                $isTimeoutText = is_string($error) && (stripos($error, 'timed out') !== false || stripos($error, 'timeout') !== false);
+                if ($isTimeoutErrno || $isTimeoutText) {
+                    $errorType = 'timeout';
+                } else {
+                    $errorType = 'curl';
+                }
+            }
 
             // Decodifica a resposta se for JSON válido
             $decodedResult = null;
@@ -72,6 +85,8 @@ class ApiConsumerService
                 'httpcode' => $httpcode,
                 'responseTime' => $responseTime,
                 'error' => $error,
+                'errno' => $errno,
+                'error_type' => $errorType,
                 'request' => $request,
                 'result' => $decodedResult,
                 'curl_info' => $curlInfo,
@@ -140,9 +155,21 @@ class ApiConsumerService
             $httpcode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
             $responseTime = round(($endTime - $startTime), 4);
             $error = curl_error($curl);
+            $errno = function_exists('curl_errno') ? curl_errno($curl) : null;
             $curlInfo = curl_getinfo($curl);
 
             curl_close($curl);
+
+            $errorType = null;
+            if (is_int($errno) && $errno !== 0) {
+                $isTimeoutErrno = (defined('CURLE_OPERATION_TIMEDOUT') && $errno === \CURLE_OPERATION_TIMEDOUT);
+                $isTimeoutText = is_string($error) && (stripos($error, 'timed out') !== false || stripos($error, 'timeout') !== false);
+                if ($isTimeoutErrno || $isTimeoutText) {
+                    $errorType = 'timeout';
+                } else {
+                    $errorType = 'curl';
+                }
+            }
 
             $decodedResult = null;
             if ($request && !$error) {
@@ -154,6 +181,8 @@ class ApiConsumerService
                 'httpcode' => $httpcode,
                 'responseTime' => $responseTime,
                 'error' => $error,
+                'errno' => $errno,
+                'error_type' => $errorType,
                 'result' => $request,
                 'decoded_result' => $decodedResult,
                 'curl_info' => $curlInfo,
