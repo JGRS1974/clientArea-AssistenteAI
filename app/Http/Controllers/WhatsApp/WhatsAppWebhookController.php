@@ -179,11 +179,26 @@ class WhatsAppWebhookController extends Controller
             ],
         ]);
 
+        $instancePhone = preg_replace('/\D/', '', (string) env('WA_INSTANCE_PHONE', ''));
+        $remoteJidDigits = preg_replace('/\D/', '', (string) data_get($webhook, 'data.key.remoteJid', ''));
+        $remoteJidAltDigits = preg_replace('/\D/', '', (string) data_get($webhook, 'data.key.remoteJidAlt', ''));
+
         $fromMe = (bool) ($normalized['from_me'] ?? false);
+
+        // Por padrão, não reprocessar mensagens enviadas pela própria instância (anti-loop).
+        // Use WA_WEBHOOK_PROCESS_FROMME=true apenas para debugging.
+        if ($fromMe && !(bool) env('WA_WEBHOOK_PROCESS_FROMME', false)) {
+            Log::info('Webhook skipped: fromMe', [
+                'sender' => $webhook['sender'] ?? null,
+                'remoteJid' => data_get($webhook, 'data.key.remoteJid'),
+                'remoteJidAlt' => data_get($webhook, 'data.key.remoteJidAlt'),
+            ]);
+            return $dedupeReturn(['ok' => true, 'skipped' => true, 'reason' => 'from_me']);
+        }
+
         $hasMedia = !empty($normalized['media']);
         // Determina se é self chat pelo número da instância
         $phone = (string) ($normalized['phone'] ?? '');
-        $instancePhone = preg_replace('/\D/', '', (string) env('WA_INSTANCE_PHONE', ''));
         $recipientDigits = preg_replace('/\D/', '', $phone);
         $isSelfChat = ($instancePhone !== '' && $recipientDigits === $instancePhone);
 
@@ -240,20 +255,27 @@ class WhatsAppWebhookController extends Controller
             }
         }
 
-        // Anti-loop: ignorar textos de self chat repetidos enviados recentemente (cooldown)
+        // Anti-loop: ignorar textos que são eco do que acabamos de enviar (cooldown curto).
+        // Isso protege quando o webhook marca fromMe errado ou quando a Evolution "espelha" mensagens.
         $cooldown = (int) env('WA_ANTI_LOOP_FROMME_TEXT_COOLDOWN_SECONDS', 0);
-        if ($isSelfChat && !$hasMedia && $cooldown > 0) {
+        if (!$hasMedia && $cooldown > 0) {
             $textIn = $normalized['text'] ?? null;
-            if (is_string($textIn) && $textIn !== '') {
-                $phoneKey = $phone ?: 'unknown';
-                $hashKey = 'wa:last_outgoing_text_hash:' . $phoneKey;
+            if (is_string($textIn) && trim($textIn) !== '' && $phone !== '') {
+                $hashKey = 'wa:last_outgoing_text_hash:' . $phone;
                 $lastHash = Cache::get($hashKey);
                 $thisHash = md5($textIn);
-                if ($lastHash && hash_equals($lastHash, $thisHash)) {
-                    Log::info('Inbound self-chat text skipped by cooldown anti-loop', [
-                        'phone' => $phoneKey,
+
+                // Só aplica se houver algum indício de "eco" (self chat ou remoteJid apontando para a instância)
+                $echoHint = $isSelfChat
+                    || ($instancePhone !== '' && $remoteJidDigits !== '' && $remoteJidDigits === $instancePhone)
+                    || ($instancePhone !== '' && $remoteJidAltDigits !== '' && $remoteJidAltDigits === $instancePhone);
+
+                if ($echoHint && $lastHash && hash_equals($lastHash, $thisHash)) {
+                    Log::info('Inbound text skipped by cooldown anti-loop', [
+                        'phone' => $phone,
+                        'is_self_chat' => $isSelfChat,
                     ]);
-                    return $dedupeReturn(['ok' => true, 'skipped' => true, 'reason' => 'self_text_cooldown']);
+                    return $dedupeReturn(['ok' => true, 'skipped' => true, 'reason' => 'text_echo_cooldown']);
                 }
             }
         }
@@ -709,7 +731,7 @@ class WhatsAppWebhookController extends Controller
         if ($eventNorm === 'messages.update' || $eventNorm === 'message.update' || $eventNorm === 'messages_update') {
             return true;
         }
-        if ($eventNorm === 'send.message' || $eventNorm === 'send_message' || $eventNorm === 'sendmessage') {
+        if ($eventNorm === 'send.message' || $eventNorm === 'send.messages' || $eventNorm === 'send_message' || $eventNorm === 'send_messages' || $eventNorm === 'sendmessage') {
             return true;
         }
 
@@ -835,6 +857,8 @@ class WhatsAppWebhookController extends Controller
     {
         $fromMe = (bool) (data_get($webhook, 'data.key.fromMe')
             ?? data_get($webhook, 'key.fromMe')
+            ?? data_get($webhook, 'data.message.key.fromMe')
+            ?? data_get($webhook, 'data.update.key.fromMe')
             ?? false);
 
         if (!$fromMe) {
@@ -843,6 +867,8 @@ class WhatsAppWebhookController extends Controller
 
         $remoteJid = (string) (data_get($webhook, 'data.key.remoteJid')
             ?? data_get($webhook, 'key.remoteJid')
+            ?? data_get($webhook, 'data.message.key.remoteJid')
+            ?? data_get($webhook, 'data.update.key.remoteJid')
             ?? '');
 
         $phone = $this->extractDigitsFromRemoteJid($remoteJid);

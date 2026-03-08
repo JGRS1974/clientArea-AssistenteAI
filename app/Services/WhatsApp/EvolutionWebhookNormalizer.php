@@ -8,6 +8,33 @@ use Illuminate\Support\Facades\Log;
 
 class EvolutionWebhookNormalizer
 {
+    private function digits(?string $value): string
+    {
+        $value = (string) $value;
+        $value = preg_replace('/@.*/', '', $value);
+        return preg_replace('/\D/', '', $value) ?: '';
+    }
+
+    private function toBoolOrNull(mixed $value): ?bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value)) {
+            return $value === 1 ? true : ($value === 0 ? false : null);
+        }
+        if (is_string($value)) {
+            $v = strtolower(trim($value));
+            if ($v === 'true' || $v === '1' || $v === 'yes') {
+                return true;
+            }
+            if ($v === 'false' || $v === '0' || $v === 'no') {
+                return false;
+            }
+        }
+        return null;
+    }
+
     /**
      * Normaliza um webhook da Evolution API para o formato interno do chat:
      *  - text: texto da mensagem
@@ -16,7 +43,23 @@ class EvolutionWebhookNormalizer
      */
     public function normalize(array $payload): array
     {
-        $fromMe = (bool) Arr::get($payload, 'data.key.fromMe', false);
+        $instancePhone = $this->digits((string) env('WA_INSTANCE_PHONE', ''));
+        $senderDigits = $this->digits(Arr::get($payload, 'sender'));
+
+        $fromMeRaw = $this->toBoolOrNull(Arr::get($payload, 'data.key.fromMe', null));
+        if ($fromMeRaw === null) {
+            // Alguns endpoints/eventos podem não embutir a key dentro de "data"
+            $fromMeRaw = $this->toBoolOrNull(Arr::get($payload, 'key.fromMe', null));
+        }
+        if ($fromMeRaw === null) {
+            $fromMeRaw = $this->toBoolOrNull(Arr::get($payload, 'data.message.key.fromMe', null));
+        }
+        $fromMe = (bool) ($fromMeRaw ?? false);
+
+        // Heurística defensiva: quando o fromMe não vem no payload, inferir pelo sender
+        if ($fromMeRaw === null && $instancePhone !== '' && $senderDigits !== '' && $senderDigits === $instancePhone) {
+            $fromMe = true;
+        }
 
         $remoteJid = Arr::get($payload, 'data.key.remoteJid');
         $remoteJidAlt = Arr::get($payload, 'data.key.remoteJidAlt');
@@ -52,7 +95,17 @@ class EvolutionWebhookNormalizer
             ?? Arr::get($payload, 'sender') // último recurso
             ?? '';
 
-        $phone = $this->normalizePhone($from);
+        // Correção: alguns eventos podem trazer remoteJid apontando para a própria instância.
+        // Nesses casos, se o sender for "o outro lado", use o sender como phone.
+        $remoteDigits = $this->digits(is_string($chosenFrom) ? $chosenFrom : (is_string($from) ? $from : ''));
+        if ($instancePhone !== '' && $remoteDigits !== '' && $remoteDigits === $instancePhone) {
+            if ($senderDigits !== '' && $senderDigits !== $instancePhone) {
+                $from = Arr::get($payload, 'sender');
+                $chosenFromSource = 'sender (remoteJid=self)';
+            }
+        }
+
+        $phone = $this->normalizePhone((string) $from);
         $text = $this->extractText($payload);
 
         // Log breve para auditoria da seleção do telefone (sem despejar payload)
@@ -67,7 +120,7 @@ class EvolutionWebhookNormalizer
                 'chosen_from_source' => $chosenFromSource,
                 'chosen_from' => $from,
                 'phone' => $phone,
-                'from_me' => (bool) Arr::get($payload, 'data.key.fromMe', false),
+                'from_me' => $fromMe,
             ]);
         } catch (\Throwable $e) {
             // ignora falhas de log
