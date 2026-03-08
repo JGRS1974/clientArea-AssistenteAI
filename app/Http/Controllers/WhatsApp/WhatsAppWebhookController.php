@@ -468,11 +468,13 @@ class WhatsAppWebhookController extends Controller
             if ($audio && !empty($audio['url'])) {
                 $pendingTtl = (int) env('WA_OUT_AUDIO_PENDING_TTL_SECONDS', 600);
                 $pendingKey = $this->pendingOutAudioKey($phone);
+                $followupMessages = $this->filterPostAudioMessages($messages);
+                $followupMessages = $this->removeAudioBaseTextFromFollowup($followupMessages, $cleanBaseText);
                 $pending = [
                     'phone' => $phone,
                     'created_at' => now()->timestamp,
                     'audio_text' => $cleanBaseText,
-                    'followup_messages' => $this->filterPostAudioMessages($messages),
+                    'followup_messages' => $followupMessages,
                     'followup_sent' => false,
                     'message_id' => null,
                 ];
@@ -1003,6 +1005,40 @@ class WhatsAppWebhookController extends Controller
         }
 
         return $unique;
+    }
+
+    private function normalizeTextForDedupe(string $text): string
+    {
+        $t = str_ireplace(['<br>', '<br/>', '<br />'], "\n", $text);
+        $t = strip_tags($t);
+        $t = html_entity_decode($t, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $t = preg_replace('/\s+/', ' ', $t ?? '');
+        $t = trim((string) ($t ?? ''));
+        $t = mb_strtolower($t, 'UTF-8');
+        $t = rtrim($t, " \t\n\r\0\x0B.");
+        return $t;
+    }
+
+    private function removeAudioBaseTextFromFollowup(array $followupMessages, string $audioBaseText): array
+    {
+        $audioNorm = $this->normalizeTextForDedupe($audioBaseText);
+        if ($audioNorm === '') {
+            return $followupMessages;
+        }
+
+        $out = [];
+        foreach ($followupMessages as $msg) {
+            if (!is_string($msg)) {
+                continue;
+            }
+            $msgNorm = $this->normalizeTextForDedupe($msg);
+            if ($msgNorm !== '' && $msgNorm === $audioNorm) {
+                continue;
+            }
+            $out[] = $msg;
+        }
+
+        return $out;
     }
 
     private function sendFollowUpForPendingAudio(string $phone): bool
